@@ -41,37 +41,17 @@ microk8s enable dns
 
 ## Build Docker Images
 
-Run the following commands to download the [official Docker image](https://github.com/apache/datafusion-ballista/pkgs/container/datafusion-ballista-standalone):
-
-```bash
-docker pull ghcr.io/apache/datafusion-ballista-standalone:0.12.0-rc4
-```
-
-Altenatively run the following commands to clone the source repository and build the Docker images from source:
-
-```bash
-git clone git@github.com:apache/datafusion-ballista.git -b 0.12.0
-cd datafusion-ballista
-./dev/build-ballista-docker.sh
-```
-
-This will create the following images:
-
-- `apache/datafusion-ballista-benchmarks:0.12.0`
-- `apache/datafusion-ballista-cli:0.12.0`
-- `apache/datafusion-ballista-executor:0.12.0`
-- `apache/datafusion-ballista-scheduler:0.12.0`
-- `apache/datafusion-ballista-standalone:0.12.0`
+To create the required Docker images please refer to the [docker deployment page](docker.md).
 
 ## Publishing Docker Images
 
 Once the images have been built, you can retag them and can push them to your favourite Docker registry.
 
 ```bash
-docker tag apache/datafusion-ballista-scheduler:0.12.0 <your-repo>/datafusion-ballista-scheduler:0.12.0
-docker tag apache/datafusion-ballista-executor:0.12.0 <your-repo>/datafusion-ballista-executor:0.12.0
-docker push <your-repo>/datafusion-ballista-scheduler:0.12.0
-docker push <your-repo>/datafusion-ballista-executor:0.12.0
+docker tag apache/datafusion-ballista-scheduler:latest <your-repo>/datafusion-ballista-scheduler:latest
+docker tag apache/datafusion-ballista-executor:latest <your-repo>/datafusion-ballista-executor:latest
+docker push <your-repo>/datafusion-ballista-scheduler:latest
+docker push <your-repo>/datafusion-ballista-executor:latest
 ```
 
 ## Create Persistent Volume and Persistent Volume Claim
@@ -159,7 +139,7 @@ spec:
     spec:
       containers:
         - name: ballista-scheduler
-          image: <your-repo>/datafusion-ballista-scheduler:0.12.0
+          image: <your-repo>/datafusion-ballista-scheduler:latest
           args: ["--bind-port=50050"]
           ports:
             - containerPort: 50050
@@ -189,7 +169,7 @@ spec:
     spec:
       containers:
         - name: ballista-executor
-          image: <your-repo>/datafusion-ballista-executor:0.12.0
+          image: <your-repo>/datafusion-ballista-executor:latest
           args:
             - "--bind-port=50051"
             - "--scheduler-host=ballista-scheduler"
@@ -228,13 +208,13 @@ ballista-executor-78cc5b6486-7crdm   0/1     Pending   0          42s
 ballista-scheduler-879f874c5-rnbd6   0/1     Pending   0          42s
 ```
 
-You can view the scheduler logs with `kubectl logs ballista-scheduler-0`:
+You can view the scheduler logs with `kubectl logs ballista-scheduler-<pod-id>`:
 
 ```
-$ kubectl logs ballista-scheduler-0
-[2021-02-19T00:24:01Z INFO  scheduler] Ballista v0.7.0 Scheduler listening on 0.0.0.0:50050
-[2021-02-19T00:24:16Z INFO  ballista::scheduler] Received register_executor request for ExecutorMetadata { id: "b5e81711-1c5c-46ec-8522-d8b359793188", host: "10.1.23.149", port: 50051 }
-[2021-02-19T00:24:17Z INFO  ballista::scheduler] Received register_executor request for ExecutorMetadata { id: "816e4502-a876-4ed8-b33f-86d243dcf63f", host: "10.1.23.150", port: 50051 }
+$ kubectl logs ballista-scheduler-<pod-id>
+INFO ballista_scheduler::scheduler_process: Ballista v52.0.0 Scheduler listening on 0.0.0.0:50050
+INFO ballista_scheduler::scheduler_server::grpc: Received register_executor request for ExecutorMetadata { id: "b5e81711-1c5c-46ec-8522-d8b359793188", host: "10.1.23.149", port: 50051 }
+INFO ballista_scheduler::scheduler_server::grpc: Received register_executor request for ExecutorMetadata { id: "816e4502-a876-4ed8-b33f-86d243dcf63f", host: "10.1.23.150", port: 50051 }
 ```
 
 ## Port Forwarding
@@ -267,9 +247,9 @@ kubectl delete -f cluster.yaml
 
 ## Autoscaling Executors
 
-Ballista supports autoscaling for executors through [Keda](http://keda.sh). Keda allows scaling a deployment
-through custom metrics which are exposed through the Ballista scheduler, and it can even scale the number of
-executors down to 0 if there is no activity in the cluster.
+Ballista supports autoscaling for executors through [Keda](http://keda.sh). Keda allows for the scaling of a
+deployment through custom metrics which are exposed through the Ballista scheduler, and it
+can even scale the number of executors down to 0 if there is no activity in the cluster.
 
 Keda can be installed in your kubernetes cluster through a single command line:
 

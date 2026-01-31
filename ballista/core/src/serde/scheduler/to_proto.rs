@@ -29,7 +29,7 @@ use crate::serde::scheduler::{
     PartitionLocation, PartitionStats,
 };
 use datafusion::physical_plan::Partitioning;
-use protobuf::{action::ActionType, operator_metric, NamedCount, NamedGauge, NamedTime};
+use protobuf::{NamedCount, NamedGauge, NamedTime, action::ActionType, operator_metric};
 
 impl TryInto<protobuf::Action> for Action {
     type Error = BallistaError;
@@ -96,6 +96,9 @@ impl Into<protobuf::PartitionStats> for PartitionStats {
     }
 }
 
+/// Converts a hash partitioning scheme to its protobuf representation.
+///
+/// Returns `None` if the partitioning is not hash-based or if no partitioning is specified.
 pub fn hash_partitioning_to_proto(
     output_partitioning: Option<&Partitioning>,
 ) -> Result<Option<datafusion_protobuf::PhysicalHashRepartition>, BallistaError> {
@@ -201,6 +204,11 @@ impl TryInto<protobuf::OperatorMetric> for &MetricValue {
                     part: ratio_metrics.part() as u64,
                     total: ratio_metrics.total() as u64,
                 })),
+            }),
+            MetricValue::OutputBatches(count) => Ok(protobuf::OperatorMetric {
+                metric: Some(
+                    operator_metric::Metric::OutputBatches(count.value() as u64),
+                ),
             }),
             // at the moment there there is no way to serialize custom metrics
             // thus at the moment we can't support it

@@ -16,9 +16,10 @@
 // under the License.
 
 use crate::config::{
-    BallistaConfig, BALLISTA_GRPC_CLIENT_MAX_MESSAGE_SIZE, BALLISTA_JOB_NAME,
+    BALLISTA_GRPC_CLIENT_MAX_MESSAGE_SIZE, BALLISTA_JOB_NAME,
     BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ, BALLISTA_SHUFFLE_READER_MAX_REQUESTS,
     BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT, BALLISTA_STANDALONE_PARALLELISM,
+    BallistaConfig,
 };
 use crate::planner::BallistaQueryPlanner;
 use crate::serde::protobuf::KeyValuePair;
@@ -29,7 +30,18 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use datafusion_proto::protobuf::LogicalPlanNode;
+use std::collections::HashMap;
+use std::error::Error;
 use std::sync::Arc;
+use tonic::codegen::http::HeaderName;
+use tonic::metadata::MetadataMap;
+use tonic::service::Interceptor;
+use tonic::transport::Endpoint;
+use tonic::{Request, Status};
+
+/// Type alias for the endpoint override function used in gRPC client configuration
+pub type EndpointOverrideFn =
+    Arc<dyn Fn(Endpoint) -> Result<Endpoint, Box<dyn Error + Send + Sync>> + Send + Sync>;
 
 /// Provides methods which adapt [SessionState]
 /// for Ballista usage
@@ -134,12 +146,37 @@ pub trait SessionConfigExt {
         max_requests: usize,
     ) -> Self;
 
+    /// Returns whether to prefer Flight protocol for remote shuffle reads.
     fn ballista_shuffle_reader_remote_prefer_flight(&self) -> bool;
 
+    /// Sets whether to prefer Flight protocol for remote shuffle reads.
     fn with_ballista_shuffle_reader_remote_prefer_flight(
         self,
         prefer_flight: bool,
     ) -> Self;
+
+    /// Set user defined metadata keys in Ballista gRPC requests
+    fn with_ballista_grpc_metadata(self, metadata: HashMap<String, String>) -> Self;
+
+    /// Get a `tonic` interceptor configured to decorate the provided metadata keys
+    fn ballista_grpc_interceptor(&self) -> Arc<BallistaGrpcMetadataInterceptor>;
+
+    /// Set a custom endpoint override function for gRPC client endpoint configuration
+    fn with_ballista_override_create_grpc_client_endpoint(
+        self,
+        override_f: EndpointOverrideFn,
+    ) -> Self;
+
+    /// Get the custom endpoint override function for gRPC client endpoint configuration
+    fn ballista_override_create_grpc_client_endpoint(
+        &self,
+    ) -> Option<Arc<BallistaConfigGrpcEndpoint>>;
+
+    /// Set whether to use TLS for executor connections (cluster-wide setting)
+    fn with_ballista_use_tls(self, use_tls: bool) -> Self;
+
+    /// Get whether to use TLS for executor connections
+    fn ballista_use_tls(&self) -> bool;
 }
 
 /// [SessionConfigHelperExt] is set of [SessionConfig] extension methods
@@ -386,6 +423,44 @@ impl SessionConfigExt for SessionConfig {
                 .set_bool(BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT, prefer_flight)
         }
     }
+
+    fn with_ballista_grpc_metadata(self, metadata: HashMap<String, String>) -> Self {
+        let extension = BallistaGrpcMetadataInterceptor::new(metadata);
+        self.with_extension(Arc::new(extension))
+    }
+
+    fn ballista_grpc_interceptor(&self) -> Arc<BallistaGrpcMetadataInterceptor> {
+        self.get_extension::<BallistaGrpcMetadataInterceptor>()
+            .unwrap_or_default()
+    }
+
+    fn with_ballista_override_create_grpc_client_endpoint(
+        self,
+        override_f: Arc<
+            dyn Fn(Endpoint) -> Result<Endpoint, Box<dyn Error + Send + Sync>>
+                + Send
+                + Sync,
+        >,
+    ) -> Self {
+        let extension = BallistaConfigGrpcEndpoint::new(override_f);
+        self.with_extension(Arc::new(extension))
+    }
+
+    fn ballista_override_create_grpc_client_endpoint(
+        &self,
+    ) -> Option<Arc<BallistaConfigGrpcEndpoint>> {
+        self.get_extension::<BallistaConfigGrpcEndpoint>()
+    }
+
+    fn with_ballista_use_tls(self, use_tls: bool) -> Self {
+        self.with_extension(Arc::new(BallistaUseTls(use_tls)))
+    }
+
+    fn ballista_use_tls(&self) -> bool {
+        self.get_extension::<BallistaUseTls>()
+            .map(|ext| ext.0)
+            .unwrap_or(false)
+    }
 }
 
 impl SessionConfigHelperExt for SessionConfig {
@@ -525,6 +600,71 @@ impl BallistaQueryPlannerExtension {
     }
 }
 
+/// Wrapper allowing additional metadata keys to be decorated to the scheduler
+/// gRPC request
+#[derive(Default, Clone)]
+pub struct BallistaGrpcMetadataInterceptor {
+    additional_metadata: HashMap<String, String>,
+}
+
+impl BallistaGrpcMetadataInterceptor {
+    /// Create a new interceptor with additional metadata
+    pub fn new(additional_metadata: HashMap<String, String>) -> Self {
+        Self {
+            additional_metadata,
+        }
+    }
+}
+
+impl Interceptor for BallistaGrpcMetadataInterceptor {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        if self.additional_metadata.is_empty() {
+            Ok(request)
+        } else {
+            let mut request_headers = request.metadata().clone().into_headers();
+            for (k, v) in &self.additional_metadata {
+                request_headers.insert(
+                    HeaderName::from_bytes(k.as_bytes())
+                        .map_err(|e| Status::invalid_argument(e.to_string()))?,
+                    v.parse().map_err(|_e| {
+                        Status::invalid_argument(format!(
+                            "{v} is not a valid header value"
+                        ))
+                    })?,
+                );
+            }
+            *request.metadata_mut() = MetadataMap::from_headers(request_headers);
+            Ok(request)
+        }
+    }
+}
+
+/// Wrapper for customizing gRPC client endpoint configuration.
+/// This allows configuring TLS, timeouts, and other transport settings.
+#[derive(Clone)]
+pub struct BallistaConfigGrpcEndpoint {
+    override_f: EndpointOverrideFn,
+}
+
+impl BallistaConfigGrpcEndpoint {
+    /// Create a new endpoint configuration wrapper with the given override function
+    pub fn new(override_f: EndpointOverrideFn) -> Self {
+        Self { override_f }
+    }
+
+    /// Apply the custom configuration to an endpoint
+    pub fn configure_endpoint(
+        &self,
+        endpoint: Endpoint,
+    ) -> Result<Endpoint, Box<dyn Error + Send + Sync>> {
+        (self.override_f)(endpoint)
+    }
+}
+
+/// Wrapper for cluster-wide TLS configuration
+#[derive(Clone, Copy)]
+pub struct BallistaUseTls(pub bool);
+
 #[cfg(test)]
 mod test {
     use datafusion::{
@@ -563,8 +703,107 @@ mod test {
         let pairs = config.to_key_value_pairs();
 
         assert!(pairs.iter().any(|p| p.key == BALLISTA_JOB_NAME));
-        assert!(pairs
-            .iter()
-            .any(|p| p.key == "datafusion.catalog.information_schema"))
+        assert!(
+            pairs
+                .iter()
+                .any(|p| p.key == "datafusion.catalog.information_schema")
+        )
+    }
+
+    #[test]
+    fn test_ballista_grpc_metadata_interceptor() {
+        use std::collections::HashMap;
+        use tonic::Request;
+        use tonic::service::Interceptor;
+
+        use super::BallistaGrpcMetadataInterceptor;
+
+        // Test empty interceptor passes through unchanged
+        let mut interceptor = BallistaGrpcMetadataInterceptor::default();
+        let request = Request::new(());
+        let result = interceptor.call(request).unwrap();
+        assert!(result.metadata().is_empty());
+
+        // Test interceptor adds metadata
+        let mut metadata = HashMap::new();
+        metadata.insert("x-api-key".to_string(), "test-key".to_string());
+        metadata.insert("x-custom-header".to_string(), "custom-value".to_string());
+
+        let mut interceptor = BallistaGrpcMetadataInterceptor::new(metadata);
+        let request = Request::new(());
+        let result = interceptor.call(request).unwrap();
+
+        assert_eq!(
+            result
+                .metadata()
+                .get("x-api-key")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "test-key"
+        );
+        assert_eq!(
+            result
+                .metadata()
+                .get("x-custom-header")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "custom-value"
+        );
+    }
+
+    #[test]
+    fn test_ballista_grpc_metadata_via_session_config() {
+        use std::collections::HashMap;
+        use tonic::Request;
+        use tonic::service::Interceptor;
+
+        // Test that metadata set via SessionConfig is accessible via interceptor
+        let mut metadata = HashMap::new();
+        metadata.insert("authorization".to_string(), "Bearer token123".to_string());
+
+        let config =
+            SessionConfig::new_with_ballista().with_ballista_grpc_metadata(metadata);
+
+        let interceptor = config.ballista_grpc_interceptor();
+        let mut interceptor = interceptor.as_ref().clone();
+
+        let request = Request::new(());
+        let result = interceptor.call(request).unwrap();
+
+        assert_eq!(
+            result
+                .metadata()
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer token123"
+        );
+    }
+
+    #[test]
+    fn test_ballista_endpoint_override_error_handling() {
+        use std::sync::Arc;
+        use tonic::transport::Endpoint;
+
+        use super::BallistaConfigGrpcEndpoint;
+
+        // Test that errors from override function are propagated
+        let override_fn: super::EndpointOverrideFn =
+            Arc::new(|_ep: Endpoint| Err("TLS configuration failed".into()));
+
+        let config_endpoint = BallistaConfigGrpcEndpoint::new(override_fn);
+        let endpoint = Endpoint::from_static("http://localhost:50051");
+        let result = config_endpoint.configure_endpoint(endpoint);
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("TLS configuration failed")
+        );
     }
 }

@@ -29,9 +29,9 @@ use crate::error::{BallistaError, Result as BResult};
 use crate::serde::scheduler::{Action, PartitionId};
 
 use arrow_flight;
-use arrow_flight::utils::flight_data_to_arrow_batch;
 use arrow_flight::Ticket;
-use arrow_flight::{flight_service_client::FlightServiceClient, FlightData};
+use arrow_flight::utils::flight_data_to_arrow_batch;
+use arrow_flight::{FlightData, flight_service_client::FlightServiceClient};
 use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::buffer::{Buffer, MutableBuffer};
 use datafusion::arrow::ipc::convert::try_schema_from_ipc_buffer;
@@ -44,8 +44,11 @@ use datafusion::arrow::{
 use datafusion::error::DataFusionError;
 use datafusion::error::Result;
 
+use crate::extension::BallistaConfigGrpcEndpoint;
 use crate::serde::protobuf;
-use crate::utils::{create_grpc_client_connection, GrpcClientConfig};
+
+use crate::utils::create_grpc_client_endpoint;
+
 use datafusion::physical_plan::{RecordBatchStream, SendableRecordBatchStream};
 use futures::{Stream, StreamExt};
 use log::{debug, warn};
@@ -69,17 +72,37 @@ impl BallistaClient {
         host: &str,
         port: u16,
         max_message_size: usize,
+        use_tls: bool,
+        customize_endpoint: Option<Arc<BallistaConfigGrpcEndpoint>>,
     ) -> BResult<Self> {
-        let addr = format!("http://{host}:{port}");
-        let grpc_config = GrpcClientConfig::default();
+        let scheme = if use_tls { "https" } else { "http" };
+
+        let addr = format!("{scheme}://{host}:{port}");
         debug!("BallistaClient connecting to {addr}");
-        let connection = create_grpc_client_connection(addr.clone(), &grpc_config)
-            .await
+
+        let mut endpoint = create_grpc_client_endpoint(addr.clone(), None)
             .map_err(|e| {
                 BallistaError::GrpcConnectionError(format!(
-                    "Error connecting to Ballista scheduler or executor at {addr}: {e:?}"
+                    "Error creating endpoint to Ballista scheduler or executor at {addr}: {e:?}"
                 ))
             })?;
+
+        if let Some(customize) = customize_endpoint {
+            endpoint = customize
+                .configure_endpoint(endpoint)
+                .map_err(|e| {
+                    BallistaError::GrpcConnectionError(format!(
+                        "Error creating endpoint to Ballista scheduler or executor at {addr}: {e:?}"
+                    ))
+                })?;
+        }
+
+        let connection = endpoint.connect().await.map_err(|e| {
+            BallistaError::GrpcConnectionError(format!(
+                "Error connecting to Ballista scheduler or executor at {addr}: {e:?}"
+            ))
+        })?;
+
         let flight_client = FlightServiceClient::new(connection)
             .max_decoding_message_size(max_message_size)
             .max_encoding_message_size(max_message_size);
@@ -361,6 +384,7 @@ pub struct BlockDataStream<S: Stream<Item = Result<prost::bytes::Bytes>> + Unpin
     state_buffer: Buffer,
     ipc_stream: S,
     transmitted: usize,
+    /// The schema of the data being streamed.
     pub schema: SchemaRef,
 }
 
@@ -368,6 +392,9 @@ pub struct BlockDataStream<S: Stream<Item = Result<prost::bytes::Bytes>> + Unpin
 const MAXIMUM_SCHEMA_BUFFER_SIZE: usize = 8_388_608;
 
 impl<S: Stream<Item = Result<prost::bytes::Bytes>> + Unpin> BlockDataStream<S> {
+    /// Creates a new `BlockDataStream` from the given IPC byte stream.
+    ///
+    /// Reads the schema from the stream header and initializes the decoder.
     pub async fn try_new(
         mut ipc_stream: S,
     ) -> std::result::Result<Self, DataFusionError> {

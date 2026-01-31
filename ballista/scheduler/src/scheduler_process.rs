@@ -15,12 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::flight_proxy_service::BallistaFlightProxyService;
+
+use arrow_flight::flight_service_server::FlightServiceServer;
+use ballista_core::BALLISTA_VERSION;
 use ballista_core::error::BallistaError;
+use ballista_core::extension::BallistaConfigGrpcEndpoint;
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
 use ballista_core::serde::{
     BallistaCodec, BallistaLogicalExtensionCodec, BallistaPhysicalExtensionCodec,
 };
-use ballista_core::BALLISTA_VERSION;
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
@@ -35,9 +39,9 @@ use crate::cluster::BallistaCluster;
 use crate::config::SchedulerConfig;
 
 use crate::metrics::default_metrics_collector;
+use crate::scheduler_server::SchedulerServer;
 #[cfg(feature = "keda-scaler")]
 use crate::scheduler_server::externalscaler::external_scaler_server::ExternalScalerServer;
-use crate::scheduler_server::SchedulerServer;
 
 /// Creates as initialized scheduler service
 /// without exposing it as a grpc service
@@ -95,6 +99,32 @@ pub async fn start_grpc_service<
 
     let mut tonic_builder = RoutesBuilder::default();
     tonic_builder.add_service(scheduler_grpc_server);
+
+    match &config.advertise_flight_sql_endpoint {
+        Some(proxy) if proxy.is_empty() => {
+            info!("Adding embedded flight proxy service on scheduler");
+            // Wrap the endpoint override function in BallistaConfigGrpcEndpoint
+            let customize_endpoint = config
+                .override_create_grpc_client_endpoint
+                .clone()
+                .map(|f| Arc::new(BallistaConfigGrpcEndpoint::new(f)));
+
+            let flight_proxy = FlightServiceServer::new(BallistaFlightProxyService::new(
+                config.grpc_server_max_encoding_message_size as usize,
+                config.grpc_server_max_decoding_message_size as usize,
+                config.use_tls,
+                customize_endpoint,
+            ))
+            .max_decoding_message_size(
+                config.grpc_server_max_decoding_message_size as usize,
+            )
+            .max_encoding_message_size(
+                config.grpc_server_max_encoding_message_size as usize,
+            );
+            tonic_builder.add_service(flight_proxy);
+        }
+        _ => {}
+    }
 
     #[cfg(feature = "keda-scaler")]
     tonic_builder.add_service(ExternalScalerServer::new(scheduler.clone()));

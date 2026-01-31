@@ -29,10 +29,10 @@ use datafusion_proto::logical_plan::file_formats::{
     ArrowLogicalExtensionCodec, AvroLogicalExtensionCodec, CsvLogicalExtensionCodec,
     JsonLogicalExtensionCodec, ParquetLogicalExtensionCodec,
 };
+use datafusion_proto::physical_plan::DefaultPhysicalExtensionCodec;
 use datafusion_proto::physical_plan::from_proto::parse_protobuf_hash_partitioning;
 use datafusion_proto::physical_plan::from_proto::parse_protobuf_partitioning;
 use datafusion_proto::physical_plan::to_proto::serialize_partitioning;
-use datafusion_proto::physical_plan::DefaultPhysicalExtensionCodec;
 use datafusion_proto::protobuf::proto_error;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use datafusion_proto::{
@@ -47,14 +47,17 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 use std::{convert::TryInto, io::Cursor};
 
+use crate::execution_plans::sort_shuffle::SortShuffleConfig;
 use crate::execution_plans::{
-    ShuffleReaderExec, ShuffleWriterExec, UnresolvedShuffleExec,
+    ShuffleReaderExec, ShuffleWriterExec, SortShuffleWriterExec, UnresolvedShuffleExec,
 };
 use crate::serde::protobuf::ballista_physical_plan_node::PhysicalPlanType;
 use crate::serde::scheduler::PartitionLocation;
 pub use generated::ballista as protobuf;
 
+/// Generated protobuf code from Ballista protocol definitions.
 pub mod generated;
+/// Scheduler-specific serialization types and conversions.
 pub mod scheduler;
 
 impl ProstMessageExt for protobuf::Action {
@@ -70,6 +73,7 @@ impl ProstMessageExt for protobuf::Action {
     }
 }
 
+/// Decodes a Ballista action from protobuf bytes.
 pub fn decode_protobuf(bytes: &[u8]) -> Result<BallistaAction, BallistaError> {
     let mut buf = Cursor::new(bytes);
 
@@ -78,6 +82,7 @@ pub fn decode_protobuf(bytes: &[u8]) -> Result<BallistaAction, BallistaError> {
         .and_then(|node| node.try_into())
 }
 
+/// Codec for serializing and deserializing Ballista logical and physical plans.
 #[derive(Clone, Debug)]
 pub struct BallistaCodec<
     T: 'static + AsLogicalPlan = LogicalPlanNode,
@@ -101,6 +106,7 @@ impl Default for BallistaCodec {
 }
 
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> BallistaCodec<T, U> {
+    /// Creates a new Ballista codec with custom extension codecs.
     pub fn new(
         logical_extension_codec: Arc<dyn LogicalExtensionCodec>,
         physical_extension_codec: Arc<dyn PhysicalExtensionCodec>,
@@ -113,15 +119,18 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> BallistaCodec<T, 
         }
     }
 
+    /// Returns the logical extension codec.
     pub fn logical_extension_codec(&self) -> &dyn LogicalExtensionCodec {
         self.logical_extension_codec.as_ref()
     }
 
+    /// Returns the physical extension codec.
     pub fn physical_extension_codec(&self) -> &dyn PhysicalExtensionCodec {
         self.physical_extension_codec.as_ref()
     }
 }
 
+/// Logical extension codec for Ballista-specific plan nodes.
 #[derive(Debug)]
 pub struct BallistaLogicalExtensionCodec {
     default_codec: Arc<dyn LogicalExtensionCodec>,
@@ -248,6 +257,7 @@ impl LogicalExtensionCodec for BallistaLogicalExtensionCodec {
     }
 }
 
+/// Physical extension codec for Ballista-specific execution plan nodes.
 #[derive(Debug)]
 pub struct BallistaPhysicalExtensionCodec {
     default_codec: Arc<dyn PhysicalExtensionCodec>,
@@ -299,6 +309,39 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                     input,
                     "".to_string(), // this is intentional but hacky - the executor will fill this in
                     shuffle_output_partitioning,
+                )?))
+            }
+            PhysicalPlanType::SortShuffleWriter(sort_shuffle_writer) => {
+                let input = inputs[0].clone();
+
+                let shuffle_output_partitioning = parse_protobuf_hash_partitioning(
+                    sort_shuffle_writer.output_partitioning.as_ref(),
+                    ctx,
+                    input.schema().as_ref(),
+                    self.default_codec.as_ref(),
+                )?;
+
+                let partitioning = shuffle_output_partitioning.ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "SortShuffleWriterExec requires hash partitioning".to_string(),
+                    )
+                })?;
+
+                let config = SortShuffleConfig::new(
+                    true,
+                    sort_shuffle_writer.buffer_size as usize,
+                    sort_shuffle_writer.memory_limit as usize,
+                    sort_shuffle_writer.spill_threshold,
+                    datafusion::arrow::ipc::CompressionType::LZ4_FRAME,
+                );
+
+                Ok(Arc::new(SortShuffleWriterExec::try_new(
+                    sort_shuffle_writer.job_id.clone(),
+                    sort_shuffle_writer.stage_id as usize,
+                    input,
+                    "".to_string(), // executor will fill this in
+                    partitioning,
+                    config,
                 )?))
             }
             PhysicalPlanType::ShuffleReader(shuffle_reader) => {
@@ -401,6 +444,51 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
             })?;
 
             Ok(())
+        } else if let Some(exec) = node.as_any().downcast_ref::<SortShuffleWriterExec>() {
+            let output_partitioning = match exec.shuffle_output_partitioning() {
+                Partitioning::Hash(exprs, partition_count) => {
+                    Some(datafusion_proto::protobuf::PhysicalHashRepartition {
+                        hash_expr: exprs
+                            .iter()
+                            .map(|expr| {
+                                datafusion_proto::physical_plan::to_proto::serialize_physical_expr(
+                                    &expr.clone(),
+                                    self.default_codec.as_ref(),
+                                )
+                            })
+                            .collect::<Result<Vec<_>, DataFusionError>>()?,
+                        partition_count: *partition_count as u64,
+                    })
+                }
+                other => {
+                    return Err(DataFusionError::Internal(format!(
+                        "SortShuffleWriterExec requires Hash partitioning, got: {other:?}"
+                    )));
+                }
+            };
+
+            let config = exec.config();
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::SortShuffleWriter(
+                    protobuf::SortShuffleWriterExecNode {
+                        job_id: exec.job_id().to_string(),
+                        stage_id: exec.stage_id() as u32,
+                        input: None,
+                        output_partitioning,
+                        buffer_size: config.buffer_size as u64,
+                        memory_limit: config.memory_limit as u64,
+                        spill_threshold: config.spill_threshold,
+                    },
+                )),
+            };
+
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode sort shuffle writer execution plan: {e:?}"
+                ))
+            })?;
+
+            Ok(())
         } else if let Some(exec) = node.as_any().downcast_ref::<ShuffleReaderExec>() {
             let stage_id = exec.stage_id as u32;
             let mut partition = vec![];
@@ -491,12 +579,12 @@ struct FileFormatProto {
 mod test {
     use super::*;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::physical_plan::expressions::col;
     use datafusion::physical_plan::Partitioning;
+    use datafusion::physical_plan::expressions::col;
     use datafusion::{
         common::DFSchema,
-        datasource::file_format::{parquet::ParquetFormatFactory, DefaultFileType},
-        logical_expr::{dml::CopyTo, EmptyRelation, LogicalPlan},
+        datasource::file_format::{DefaultFileType, parquet::ParquetFormatFactory},
+        logical_expr::{EmptyRelation, LogicalPlan, dml::CopyTo},
         prelude::SessionContext,
     };
     use datafusion_proto::{logical_plan::AsLogicalPlan, protobuf::LogicalPlanNode};

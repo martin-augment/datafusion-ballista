@@ -4,7 +4,10 @@
 /// /////////////////////////////////////////////////////////////////////////////////////////////////
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BallistaPhysicalPlanNode {
-    #[prost(oneof = "ballista_physical_plan_node::PhysicalPlanType", tags = "1, 2, 3")]
+    #[prost(
+        oneof = "ballista_physical_plan_node::PhysicalPlanType",
+        tags = "1, 2, 3, 4"
+    )]
     pub physical_plan_type: ::core::option::Option<
         ballista_physical_plan_node::PhysicalPlanType,
     >,
@@ -19,6 +22,8 @@ pub mod ballista_physical_plan_node {
         ShuffleReader(super::ShuffleReaderExecNode),
         #[prost(message, tag = "3")]
         UnresolvedShuffle(super::UnresolvedShuffleExecNode),
+        #[prost(message, tag = "4")]
+        SortShuffleWriter(super::SortShuffleWriterExecNode),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -35,6 +40,27 @@ pub struct ShuffleWriterExecNode {
     pub output_partitioning: ::core::option::Option<
         ::datafusion_proto::protobuf::PhysicalHashRepartition,
     >,
+}
+/// Sort-based shuffle writer that produces consolidated files with index
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SortShuffleWriterExecNode {
+    #[prost(string, tag = "1")]
+    pub job_id: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub stage_id: u32,
+    #[prost(message, optional, tag = "3")]
+    pub input: ::core::option::Option<::datafusion_proto::protobuf::PhysicalPlanNode>,
+    #[prost(message, optional, tag = "4")]
+    pub output_partitioning: ::core::option::Option<
+        ::datafusion_proto::protobuf::PhysicalHashRepartition,
+    >,
+    /// Configuration for sort shuffle
+    #[prost(uint64, tag = "5")]
+    pub buffer_size: u64,
+    #[prost(uint64, tag = "6")]
+    pub memory_limit: u64,
+    #[prost(double, tag = "7")]
+    pub spill_threshold: f64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UnresolvedShuffleExecNode {
@@ -409,7 +435,7 @@ pub struct NamedRatio {
 pub struct OperatorMetric {
     #[prost(
         oneof = "operator_metric::Metric",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
     )]
     pub metric: ::core::option::Option<operator_metric::Metric>,
 }
@@ -445,6 +471,8 @@ pub mod operator_metric {
         PruningMetrics(super::NamedPruningMetrics),
         #[prost(message, tag = "14")]
         Ratio(super::NamedRatio),
+        #[prost(uint64, tag = "15")]
+        OutputBatches(u64),
     }
 }
 /// Used by scheduler
@@ -821,7 +849,7 @@ pub struct ExecuteQueryParams {
     /// client and scheduler
     #[prost(string, tag = "5")]
     pub operation_id: ::prost::alloc::string::String,
-    #[prost(oneof = "execute_query_params::Query", tags = "1, 2")]
+    #[prost(oneof = "execute_query_params::Query", tags = "1, 6")]
     pub query: ::core::option::Option<execute_query_params::Query>,
 }
 /// Nested message and enum types in `ExecuteQueryParams`.
@@ -830,9 +858,8 @@ pub mod execute_query_params {
     pub enum Query {
         #[prost(bytes, tag = "1")]
         LogicalPlan(::prost::alloc::vec::Vec<u8>),
-        /// I'd suggest to remove this, if SQL needed use `flight-sql`
-        #[prost(string, tag = "2")]
-        Sql(::prost::alloc::string::String),
+        #[prost(bytes, tag = "6")]
+        SubstraitPlan(::prost::alloc::vec::Vec<u8>),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -984,6 +1011,18 @@ pub mod job_status {
 pub struct GetJobStatusResult {
     #[prost(message, optional, tag = "1")]
     pub status: ::core::option::Option<JobStatus>,
+    #[prost(oneof = "get_job_status_result::FlightProxy", tags = "2, 3")]
+    pub flight_proxy: ::core::option::Option<get_job_status_result::FlightProxy>,
+}
+/// Nested message and enum types in `GetJobStatusResult`.
+pub mod get_job_status_result {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum FlightProxy {
+        #[prost(bool, tag = "2")]
+        Local(bool),
+        #[prost(string, tag = "3")]
+        External(::prost::alloc::string::String),
+    }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FilePartitionMetadata {

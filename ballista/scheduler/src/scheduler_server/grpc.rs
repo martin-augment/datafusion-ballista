@@ -21,14 +21,15 @@ use ballista_core::extension::SessionConfigHelperExt;
 use ballista_core::serde::protobuf::execute_query_params::Query;
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpc;
 use ballista_core::serde::protobuf::{
-    execute_query_failure_result, execute_query_result, AvailableTaskSlots,
-    CancelJobParams, CancelJobResult, CleanJobDataParams, CleanJobDataResult,
-    CreateUpdateSessionParams, CreateUpdateSessionResult, ExecuteQueryFailureResult,
-    ExecuteQueryParams, ExecuteQueryResult, ExecuteQuerySuccessResult, ExecutorHeartbeat,
-    ExecutorStoppedParams, ExecutorStoppedResult, GetJobStatusParams, GetJobStatusResult,
-    HeartBeatParams, HeartBeatResult, PollWorkParams, PollWorkResult,
-    RegisterExecutorParams, RegisterExecutorResult, RemoveSessionParams,
-    RemoveSessionResult, UpdateTaskStatusParams, UpdateTaskStatusResult,
+    AvailableTaskSlots, CancelJobParams, CancelJobResult, CleanJobDataParams,
+    CleanJobDataResult, CreateUpdateSessionParams, CreateUpdateSessionResult,
+    ExecuteQueryFailureResult, ExecuteQueryParams, ExecuteQueryResult,
+    ExecuteQuerySuccessResult, ExecutorHeartbeat, ExecutorStoppedParams,
+    ExecutorStoppedResult, GetJobStatusParams, GetJobStatusResult, HeartBeatParams,
+    HeartBeatResult, PollWorkParams, PollWorkResult, RegisterExecutorParams,
+    RegisterExecutorResult, RemoveSessionParams, RemoveSessionResult,
+    UpdateTaskStatusParams, UpdateTaskStatusResult, execute_query_failure_result,
+    execute_query_result,
 };
 use ballista_core::serde::scheduler::ExecutorMetadata;
 use datafusion_proto::logical_plan::AsLogicalPlan;
@@ -36,11 +37,18 @@ use datafusion_proto::physical_plan::AsExecutionPlan;
 use log::{debug, error, info, trace, warn};
 use std::net::SocketAddr;
 
+#[cfg(feature = "substrait")]
+use {
+    datafusion_substrait::logical_plan::consumer::from_substrait_plan,
+    datafusion_substrait::serializer::deserialize_bytes,
+};
+
 use std::ops::Deref;
 
 use crate::cluster::{bind_task_bias, bind_task_round_robin};
 use crate::config::TaskDistributionPolicy;
 use crate::scheduler_server::event::QueryStageSchedulerEvent;
+use ballista_core::serde::protobuf::get_job_status_result::FlightProxy;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tonic::{Request, Response, Status};
 
@@ -116,16 +124,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                 TaskDistributionPolicy::RoundRobin => {
                     bind_task_round_robin(available_slots, running_jobs, |_| false).await
                 }
-                TaskDistributionPolicy::ConsistentHash{..} => {
+                TaskDistributionPolicy::ConsistentHash { .. } => {
                     return Err(Status::unimplemented(
-                        "ConsistentHash TaskDistribution is not feasible for pull-based task scheduling"))
+                        "ConsistentHash TaskDistribution is not feasible for pull-based task scheduling",
+                    ));
                 }
 
-                TaskDistributionPolicy::Custom(ref policy) =>{
-                    policy.bind_tasks(available_slots, running_jobs).await.map_err(|e| {
-                        Status::internal(e.to_string())
-                    })?
-                }
+                TaskDistributionPolicy::Custom(ref policy) => policy
+                    .bind_tasks(available_slots, running_jobs)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?,
             };
 
             let mut tasks = vec![];
@@ -345,7 +353,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
 
             let job_id = self.state.task_manager.generate_job_id();
 
-            info!("execution query - session_id: {session_id}, operation_id: {operation_id}, job_name: {job_name}, job_id: {job_id}");
+            info!(
+                "execution query - session_id: {session_id}, operation_id: {operation_id}, job_name: {job_name}, job_id: {job_id}"
+            );
 
             let (session_id, session_ctx) = {
                 let session_config = self.state.session_manager.produce_config();
@@ -389,26 +399,35 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
                         }
                     }
                 }
-                Query::Sql(sql) => {
-                    match session_ctx
-                        .sql(&sql)
+                #[cfg(not(feature = "substrait"))]
+                Query::SubstraitPlan(_) => {
+                    let msg = "Received query type \"Substrait\", enable \"substrait\" feature to support Substrait plans.".to_string();
+                    error!("{msg}");
+                    return Ok(Response::new(ExecuteQueryResult {
+                        operation_id,
+                        result: Some(execute_query_result::Result::Failure(
+                            ExecuteQueryFailureResult {
+                                failure: Some(execute_query_failure_result::Failure::PlanParsingFailure(msg)),
+                            }
+                        ))
+                    }));
+                }
+                #[cfg(feature = "substrait")]
+                Query::SubstraitPlan(bytes) => {
+                    let plan = deserialize_bytes(bytes).await.map_err(|e| {
+                        let msg = format!("Could not parse substrait plan: {e}");
+                        error!("{}", msg);
+                        Status::internal(msg)
+                    })?;
+
+                    let ctx = session_ctx.as_ref().clone();
+                    from_substrait_plan(&ctx.state(), &plan)
                         .await
-                        .and_then(|df| df.into_optimized_plan())
-                    {
-                        Ok(plan) => plan,
-                        Err(e) => {
-                            let msg = format!("Error parsing SQL: {e}");
-                            error!("{msg}");
-                            return Ok(Response::new(ExecuteQueryResult {
-                                operation_id,
-                                result: Some(execute_query_result::Result::Failure(
-                                    ExecuteQueryFailureResult {
-                                        failure: Some(execute_query_failure_result::Failure::PlanParsingFailure(msg)),
-                                    },
-                                )),
-                            }));
-                        }
-                    }
+                        .map_err(|e| {
+                            let msg = format!("Could not parse substrait plan: {e}");
+                            error!("{}", msg);
+                            Status::internal(msg)
+                        })?
                 }
             };
 
@@ -446,8 +465,23 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
     ) -> Result<Response<GetJobStatusResult>, Status> {
         let job_id = request.into_inner().job_id;
         trace!("Received get_job_status request for job {}", job_id);
+
+        let flight_proxy =
+            self.state
+                .config
+                .advertise_flight_sql_endpoint
+                .clone()
+                .map(|s| match s {
+                    s if s.is_empty() => FlightProxy::Local(true),
+                    s => FlightProxy::External(s),
+                });
+
         match self.state.task_manager.get_job_status(&job_id).await {
-            Ok(status) => Ok(Response::new(GetJobStatusResult { status })),
+            Ok(status) => Ok(Response::new(GetJobStatusResult {
+                status,
+                flight_proxy,
+            })),
+
             Err(e) => {
                 let msg = format!("Error getting status for job {job_id}: {e:?}");
                 error!("{msg}");
@@ -544,15 +578,23 @@ mod test {
     use datafusion_proto::protobuf::PhysicalPlanNode;
     use tonic::Request;
 
+    #[cfg(feature = "substrait")]
+    use {
+        ballista_core::serde::protobuf::ExecuteQueryParams,
+        ballista_core::serde::protobuf::execute_query_params::Query,
+        datafusion::prelude::{SessionConfig, SessionContext},
+        datafusion_substrait::serializer::serialize_bytes,
+    };
+
     use crate::config::SchedulerConfig;
     use crate::metrics::default_metrics_collector;
     use ballista_core::error::BallistaError;
+    use ballista_core::serde::BallistaCodec;
     use ballista_core::serde::protobuf::{
-        executor_status, ExecutorRegistration, ExecutorStatus, ExecutorStoppedParams,
-        HeartBeatParams, PollWorkParams, RegisterExecutorParams,
+        ExecutorRegistration, ExecutorStatus, ExecutorStoppedParams, HeartBeatParams,
+        PollWorkParams, RegisterExecutorParams, executor_status,
     };
     use ballista_core::serde::scheduler::ExecutorSpecification;
-    use ballista_core::serde::BallistaCodec;
 
     use crate::state::SchedulerState;
     use crate::test_utils::await_condition;
@@ -868,6 +910,82 @@ mod test {
 
         let active_executors = state.executor_manager.get_alive_executors();
         assert!(active_executors.is_empty());
+        Ok(())
+    }
+    #[tokio::test]
+    #[cfg(feature = "substrait")]
+    async fn test_substrait_compatibility() -> Result<(), BallistaError> {
+        let cluster = test_cluster_context();
+
+        let config = SchedulerConfig::default();
+        let mut scheduler: SchedulerServer<LogicalPlanNode, PhysicalPlanNode> =
+            SchedulerServer::new(
+                "localhost:50050".to_owned(),
+                cluster.clone(),
+                BallistaCodec::default(),
+                Arc::new(config),
+                default_metrics_collector().unwrap(),
+            );
+        scheduler.init().await?;
+
+        let exec_meta = ExecutorRegistration {
+            id: "abc".to_owned(),
+            host: Some("http://localhost:8080".to_owned()),
+            port: 0,
+            grpc_port: 0,
+            specification: Some(ExecutorSpecification { task_slots: 2 }.into()),
+        };
+
+        let request: Request<RegisterExecutorParams> =
+            Request::new(RegisterExecutorParams {
+                metadata: Some(exec_meta.clone()),
+            });
+        let response = scheduler
+            .register_executor(request)
+            .await
+            .expect("Received error response")
+            .into_inner();
+
+        // registration should success
+        assert!(response.success);
+
+        let state = scheduler.state.clone();
+        // executor should be registered
+        let stored_executor = state
+            .executor_manager
+            .get_executor_metadata("abc")
+            .await
+            .expect("getting executor");
+
+        assert_eq!(stored_executor.grpc_port, 0);
+        assert_eq!(stored_executor.port, 0);
+        assert_eq!(stored_executor.specification.task_slots, 2);
+        assert_eq!(stored_executor.host, "http://localhost:8080".to_owned());
+
+        // Context strictly used for values-based query serialization to avoid
+        // needing to register tables and keep them in sync with the scheduler instance.
+        // We only truly desire to test proper reception of a Substrait plan, not explicit
+        // SubstraitPlan -> LogicalPlan conversions.
+        let config = SessionConfig::new();
+        let ctx = SessionContext::new_with_config(config);
+        let serialized_substrait_plan = serialize_bytes(
+            "SELECT a, b, ABS(a) + ABS(b) FROM (VALUES (1, 2), (3, 4)) AS t(a, b)",
+            &ctx,
+        )
+        .await?;
+
+        let execute_query_request = Request::new(ExecuteQueryParams {
+            session_id: uuid::Uuid::new_v4().to_string(),
+            settings: vec![],
+            operation_id: uuid::Uuid::now_v7().to_string(),
+            query: Some(Query::SubstraitPlan(serialized_substrait_plan)),
+        });
+        let response = scheduler.execute_query(execute_query_request).await?;
+        response
+            .into_inner()
+            .result
+            .expect("Received error response");
+
         Ok(())
     }
 }

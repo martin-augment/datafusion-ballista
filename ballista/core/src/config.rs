@@ -27,28 +27,50 @@ use datafusion::{
     arrow::datatypes::DataType, common::config_err, config::ConfigExtension,
 };
 
+/// Configuration key for setting the job name displayed in the web UI.
 pub const BALLISTA_JOB_NAME: &str = "ballista.job.name";
+/// Configuration key for standalone processing parallelism.
 pub const BALLISTA_STANDALONE_PARALLELISM: &str = "ballista.standalone.parallelism";
 /// max message size for gRPC clients
 pub const BALLISTA_GRPC_CLIENT_MAX_MESSAGE_SIZE: &str =
     "ballista.grpc_client_max_message_size";
+/// Configuration key for maximum concurrent shuffle read requests.
 pub const BALLISTA_SHUFFLE_READER_MAX_REQUESTS: &str =
     "ballista.shuffle.max_concurrent_read_requests";
+/// Configuration key to force remote reads even for local partitions.
 pub const BALLISTA_SHUFFLE_READER_FORCE_REMOTE_READ: &str =
     "ballista.shuffle.force_remote_read";
+/// Configuration key to prefer Flight protocol for remote shuffle reads.
 pub const BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT: &str =
     "ballista.shuffle.remote_read_prefer_flight";
 
-// gRPC client timeout configurations
+/// Configuration key for gRPC client connection timeout in seconds.
 pub const BALLISTA_GRPC_CLIENT_CONNECT_TIMEOUT_SECONDS: &str =
     "ballista.grpc.client.connect_timeout_seconds";
+/// Configuration key for gRPC client request timeout in seconds.
 pub const BALLISTA_GRPC_CLIENT_TIMEOUT_SECONDS: &str =
     "ballista.grpc.client.timeout_seconds";
+/// Configuration key for TCP keep-alive interval for gRPC clients in seconds.
 pub const BALLISTA_GRPC_CLIENT_TCP_KEEPALIVE_SECONDS: &str =
     "ballista.grpc.client.tcp_keepalive_seconds";
+/// Configuration key for HTTP/2 keep-alive interval for gRPC clients in seconds.
 pub const BALLISTA_GRPC_CLIENT_HTTP2_KEEPALIVE_INTERVAL_SECONDS: &str =
     "ballista.grpc.client.http2_keepalive_interval_seconds";
 
+/// Configuration key for enabling sort-based shuffle.
+pub const BALLISTA_SHUFFLE_SORT_BASED_ENABLED: &str =
+    "ballista.shuffle.sort_based.enabled";
+/// Configuration key for sort shuffle per-partition buffer size in bytes.
+pub const BALLISTA_SHUFFLE_SORT_BASED_BUFFER_SIZE: &str =
+    "ballista.shuffle.sort_based.buffer_size";
+/// Configuration key for sort shuffle total memory limit in bytes.
+pub const BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT: &str =
+    "ballista.shuffle.sort_based.memory_limit";
+/// Configuration key for sort shuffle spill threshold (0.0-1.0).
+pub const BALLISTA_SHUFFLE_SORT_BASED_SPILL_THRESHOLD: &str =
+    "ballista.shuffle.sort_based.spill_threshold";
+
+/// Result type for configuration parsing operations.
 pub type ParseResult<T> = result::Result<T, String>;
 use std::sync::LazyLock;
 
@@ -91,7 +113,23 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
         ConfigEntry::new(BALLISTA_GRPC_CLIENT_HTTP2_KEEPALIVE_INTERVAL_SECONDS.to_string(),
                          "HTTP/2 keep-alive interval for gRPC client in seconds".to_string(),
                          DataType::UInt64,
-                         Some((300).to_string()))
+                         Some((300).to_string())),
+        ConfigEntry::new(BALLISTA_SHUFFLE_SORT_BASED_ENABLED.to_string(),
+                         "Enable sort-based shuffle which writes consolidated files with index".to_string(),
+                         DataType::Boolean,
+                         Some((false).to_string())),
+        ConfigEntry::new(BALLISTA_SHUFFLE_SORT_BASED_BUFFER_SIZE.to_string(),
+                         "Per-partition buffer size in bytes for sort shuffle".to_string(),
+                         DataType::UInt64,
+                         Some((1024 * 1024).to_string())),
+        ConfigEntry::new(BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT.to_string(),
+                         "Total memory limit in bytes for sort shuffle buffers".to_string(),
+                         DataType::UInt64,
+                         Some((256 * 1024 * 1024).to_string())),
+        ConfigEntry::new(BALLISTA_SHUFFLE_SORT_BASED_SPILL_THRESHOLD.to_string(),
+                         "Spill threshold as decimal fraction (0.0-1.0) of memory limit".to_string(),
+                         DataType::Utf8,
+                         Some("0.8".to_string()))
     ];
     entries
         .into_iter()
@@ -159,6 +197,7 @@ impl BallistaConfig {
         Ok(Self { settings })
     }
 
+    /// Validates that a string value can be parsed as the specified data type.
     pub fn parse_value(val: &str, data_type: DataType) -> ParseResult<()> {
         match data_type {
             DataType::UInt16 => {
@@ -192,39 +231,47 @@ impl BallistaConfig {
         Ok(())
     }
 
-    // All available configuration options
+    /// Returns all available configuration entries with their metadata.
     pub fn valid_entries() -> &'static HashMap<String, ConfigEntry> {
         &CONFIG_ENTRIES
     }
 
+    /// Returns the current configuration settings as a map.
     pub fn settings(&self) -> &HashMap<String, String> {
         &self.settings
     }
 
+    /// Returns the maximum message size for gRPC clients in bytes.
     pub fn default_grpc_client_max_message_size(&self) -> usize {
         self.get_usize_setting(BALLISTA_GRPC_CLIENT_MAX_MESSAGE_SIZE)
     }
 
+    /// Returns the standalone processing parallelism level.
     pub fn default_standalone_parallelism(&self) -> usize {
         self.get_usize_setting(BALLISTA_STANDALONE_PARALLELISM)
     }
 
+    /// Returns the maximum number of concurrent shuffle reader requests.
     pub fn shuffle_reader_maximum_concurrent_requests(&self) -> usize {
         self.get_usize_setting(BALLISTA_SHUFFLE_READER_MAX_REQUESTS)
     }
 
+    /// Returns the gRPC client connection timeout in seconds.
     pub fn default_grpc_client_connect_timeout_seconds(&self) -> usize {
         self.get_usize_setting(BALLISTA_GRPC_CLIENT_CONNECT_TIMEOUT_SECONDS)
     }
 
+    /// Returns the gRPC client request timeout in seconds.
     pub fn default_grpc_client_timeout_seconds(&self) -> usize {
         self.get_usize_setting(BALLISTA_GRPC_CLIENT_TIMEOUT_SECONDS)
     }
 
+    /// Returns the TCP keep-alive interval for gRPC clients in seconds.
     pub fn default_grpc_client_tcp_keepalive_seconds(&self) -> usize {
         self.get_usize_setting(BALLISTA_GRPC_CLIENT_TCP_KEEPALIVE_SECONDS)
     }
 
+    /// Returns the HTTP/2 keep-alive interval for gRPC clients in seconds.
     pub fn default_grpc_client_http2_keepalive_interval_seconds(&self) -> usize {
         self.get_usize_setting(BALLISTA_GRPC_CLIENT_HTTP2_KEEPALIVE_INTERVAL_SECONDS)
     }
@@ -244,6 +291,29 @@ impl BallistaConfig {
     /// Block protocol is usually more performant than flight protocol
     pub fn shuffle_reader_remote_prefer_flight(&self) -> bool {
         self.get_bool_setting(BALLISTA_SHUFFLE_READER_REMOTE_PREFER_FLIGHT)
+    }
+
+    /// Returns whether sort-based shuffle is enabled.
+    ///
+    /// When enabled, shuffle writes produce a single consolidated file per input
+    /// partition with an index file, rather than one file per output partition.
+    pub fn shuffle_sort_based_enabled(&self) -> bool {
+        self.get_bool_setting(BALLISTA_SHUFFLE_SORT_BASED_ENABLED)
+    }
+
+    /// Returns the per-partition buffer size for sort-based shuffle in bytes.
+    pub fn shuffle_sort_based_buffer_size(&self) -> usize {
+        self.get_usize_setting(BALLISTA_SHUFFLE_SORT_BASED_BUFFER_SIZE)
+    }
+
+    /// Returns the total memory limit for sort-based shuffle buffers in bytes.
+    pub fn shuffle_sort_based_memory_limit(&self) -> usize {
+        self.get_usize_setting(BALLISTA_SHUFFLE_SORT_BASED_MEMORY_LIMIT)
+    }
+
+    /// Returns the spill threshold for sort-based shuffle (0.0-1.0).
+    pub fn shuffle_sort_based_spill_threshold(&self) -> f64 {
+        self.get_f64_setting(BALLISTA_SHUFFLE_SORT_BASED_SPILL_THRESHOLD)
     }
 
     fn get_usize_setting(&self, key: &str) -> usize {
@@ -280,6 +350,16 @@ impl BallistaConfig {
             // infallible because we validate all configs in the constructor
             let v = entries.get(key).unwrap().default_value.as_ref().unwrap();
             v.to_string()
+        }
+    }
+
+    fn get_f64_setting(&self, key: &str) -> f64 {
+        if let Some(v) = self.settings.get(key) {
+            v.parse::<f64>().unwrap()
+        } else {
+            let entries = Self::valid_entries();
+            let v = entries.get(key).unwrap().default_value.as_ref().unwrap();
+            v.parse::<f64>().unwrap()
         }
     }
 }
@@ -360,13 +440,17 @@ impl std::str::FromStr for TaskSchedulingPolicy {
     }
 }
 
-// an enum used to configure the log rolling policy
+/// Configures the log file rotation policy.
 #[derive(Clone, Copy, Debug, serde::Deserialize, Default)]
 #[cfg_attr(feature = "build-binary", derive(clap::ValueEnum))]
 pub enum LogRotationPolicy {
+    /// Rotate log files every minute.
     Minutely,
+    /// Rotate log files every hour.
     Hourly,
+    /// Rotate log files daily.
     Daily,
+    /// Never rotate log files.
     #[default]
     Never,
 }

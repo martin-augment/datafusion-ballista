@@ -19,7 +19,7 @@
 name = "ballista-core"
 description = "Ballista Distributed Compute"
 license = "Apache-2.0"
-version = "50.0.0"
+version = "52.0.0"
 homepage = "https://datafusion.apache.org/ballista/"
 repository = "https://github.com/apache/datafusion-ballista"
 readme = "README.md"
@@ -35,7 +35,9 @@ exclude = ["*.proto"]
 rustc-args = ["--cfg", "docsrs"]
 
 [features]
+arrow-ipc-optimizations = []
 build-binary = ["aws-config", "aws-credential-types", "clap", "object_store"]
+default = ["arrow-ipc-optimizations"]
 docsrs = []
 # Used for testing ONLY: causes all values to hash to the same value (test for collisions)
 force_hash_collisions = ["datafusion/force_hash_collisions"]
@@ -54,13 +56,13 @@ futures = { workspace = true }
 itertools = "0.14"
 log = { workspace = true }
 md-5 = { version = "^0.10.0" }
-object_store = { workspace = true, features = ["aws","http"], optional = true }
+object_store = { workspace = true, features = ["aws", "http"], optional = true }
 parking_lot = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }

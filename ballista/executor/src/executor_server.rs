@@ -15,11 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Executor gRPC server for push-based task scheduling.
+//!
+//! This module implements the executor-side gRPC service that receives tasks
+//! from the scheduler in push-based scheduling mode. It handles task execution,
+//! heartbeat communication, and status reporting.
+
 use ballista_core::BALLISTA_VERSION;
 use std::collections::HashMap;
 use std::convert::TryInto;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
@@ -28,23 +34,25 @@ use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
 use ballista_core::error::BallistaError;
-use ballista_core::extension::SessionConfigExt;
+use ballista_core::extension::EndpointOverrideFn;
+use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
-    executor_grpc_server::{ExecutorGrpc, ExecutorGrpcServer},
-    executor_metric, executor_status,
-    scheduler_grpc_client::SchedulerGrpcClient,
     CancelTasksParams, CancelTasksResult, ExecutorMetric, ExecutorStatus,
     HeartBeatParams, LaunchMultiTaskParams, LaunchMultiTaskResult, LaunchTaskParams,
     LaunchTaskResult, RegisterExecutorParams, RemoveJobDataParams, RemoveJobDataResult,
     StopExecutorParams, StopExecutorResult, TaskStatus, UpdateTaskStatusParams,
-};
-use ballista_core::serde::scheduler::from_proto::{
-    get_task_definition, get_task_definition_vec,
+    executor_grpc_server::{ExecutorGrpc, ExecutorGrpcServer},
+    executor_metric, executor_status,
+    scheduler_grpc_client::SchedulerGrpcClient,
 };
 use ballista_core::serde::scheduler::PartitionId;
 use ballista_core::serde::scheduler::TaskDefinition;
-use ballista_core::serde::BallistaCodec;
-use ballista_core::utils::{create_grpc_client_connection, create_grpc_server};
+
+use ballista_core::serde::scheduler::from_proto::{
+    get_task_definition, get_task_definition_vec,
+};
+use ballista_core::utils::{create_grpc_client_endpoint, create_grpc_server};
+
 use dashmap::DashMap;
 use datafusion::execution::TaskContext;
 use datafusion_proto::{logical_plan::AsLogicalPlan, physical_plan::AsExecutionPlan};
@@ -53,9 +61,9 @@ use tokio::task::JoinHandle;
 
 use crate::cpu_bound_executor::DedicatedExecutor;
 use crate::executor::Executor;
-use crate::executor_process::{remove_job_dir, ExecutorProcessConfig};
+use crate::executor_process::{ExecutorProcessConfig, remove_job_dir};
 use crate::shutdown::ShutdownNotifier;
-use crate::{as_task_status, TaskExecutionTimes};
+use crate::{TaskExecutionTimes, as_task_status};
 
 type ServerHandle = JoinHandle<Result<(), BallistaError>>;
 type SchedulerClients = Arc<DashMap<String, SchedulerGrpcClient<Channel>>>;
@@ -74,6 +82,15 @@ struct CuratorTaskStatus {
     task_status: TaskStatus,
 }
 
+/// Starts the executor gRPC server and registers with the scheduler.
+///
+/// This function initializes the push-based task scheduling infrastructure:
+/// - Creates the executor gRPC server for receiving tasks
+/// - Registers the executor with the scheduler
+/// - Starts the heartbeat loop
+/// - Starts the task runner pool
+///
+/// Returns a handle to the server task that can be awaited for completion.
 pub async fn startup<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
     mut scheduler: SchedulerGrpcClient<Channel>,
     config: Arc<ExecutorProcessConfig>,
@@ -98,6 +115,7 @@ pub async fn startup<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>(
         codec,
         config.grpc_max_encoding_message_size as usize,
         config.grpc_max_decoding_message_size as usize,
+        config.override_create_grpc_client_endpoint.clone(),
     );
 
     // 1. Start executor grpc service
@@ -175,16 +193,29 @@ async fn register_executor(
     }
 }
 
+/// The executor's gRPC server that handles incoming task requests.
+///
+/// This server implements the ExecutorGrpc trait and manages task execution,
+/// cancellation, and status reporting for push-based scheduling.
 #[derive(Clone)]
 pub struct ExecutorServer<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> {
+    /// Timestamp when the server was started (milliseconds since epoch).
     _start_time: u128,
+    /// The executor instance that runs tasks.
     executor: Arc<Executor>,
+    /// Environment containing task communication channels.
     executor_env: ExecutorEnv,
+    /// Codec for serializing/deserializing execution plans.
     codec: BallistaCodec<T, U>,
+    /// gRPC client for the scheduler this executor registered with.
     scheduler_to_register: SchedulerGrpcClient<Channel>,
+    /// Cache of scheduler clients for communicating with multiple schedulers.
     schedulers: SchedulerClients,
+    /// Maximum size for outgoing gRPC messages.
     grpc_max_encoding_message_size: usize,
+    /// Maximum size for incoming gRPC messages.
     grpc_max_decoding_message_size: usize,
+    override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
 }
 
 #[derive(Clone)]
@@ -211,6 +242,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
         codec: BallistaCodec<T, U>,
         grpc_max_encoding_message_size: usize,
         grpc_max_decoding_message_size: usize,
+        override_create_grpc_client_endpoint: Option<EndpointOverrideFn>,
     ) -> Self {
         Self {
             _start_time: SystemTime::now()
@@ -224,6 +256,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             schedulers: Default::default(),
             grpc_max_encoding_message_size,
             grpc_max_decoding_message_size,
+            override_create_grpc_client_endpoint,
         }
     }
 
@@ -237,11 +270,17 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             Ok(scheduler)
         } else {
             let scheduler_url = format!("http://{scheduler_id}");
-            let session_config = (self.executor.config_producer)();
-            let ballista_config = session_config.ballista_config();
-            let connection =
-                create_grpc_client_connection(scheduler_url, &(&ballista_config).into())
-                    .await?;
+            let mut endpoint = create_grpc_client_endpoint(scheduler_url, None)?;
+
+            if let Some(ref override_fn) = self.override_create_grpc_client_endpoint {
+                endpoint = override_fn(endpoint).map_err(|e| {
+                    BallistaError::GrpcConnectionError(format!(
+                        "Failed to customize endpoint for scheduler {scheduler_id}: {e}"
+                    ))
+                })?;
+            }
+
+            let connection = endpoint.connect().await?;
             let scheduler = SchedulerGrpcClient::new(connection)
                 .max_encoding_message_size(self.grpc_max_encoding_message_size)
                 .max_decoding_message_size(self.grpc_max_decoding_message_size);
@@ -522,7 +561,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskRunnerPool<T,
                             break;
                         }
                         Err(TryRecvError::Disconnected) => {
-                            info!("Channel is closed and will exit the task status report loop");
+                            info!(
+                                "Channel is closed and will exit the task status report loop"
+                            );
                             drop(tasks_status_complete);
                             return;
                         }

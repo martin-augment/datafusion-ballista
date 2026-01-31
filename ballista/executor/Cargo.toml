@@ -19,7 +19,7 @@
 name = "ballista-executor"
 description = "Ballista Distributed Compute - Executor"
 license = "Apache-2.0"
-version = "50.0.0"
+version = "52.0.0"
 homepage = "https://datafusion.apache.org/ballista/"
 repository = "https://github.com/apache/datafusion-ballista"
 readme = "README.md"
@@ -33,14 +33,15 @@ path = "src/bin/main.rs"
 required-features = ["build-binary"]
 
 [features]
+arrow-ipc-optimizations = []
 build-binary = ["clap", "tracing-subscriber", "tracing-appender", "tracing", "ballista-core/build-binary"]
-default = ["build-binary", "mimalloc"]
+default = ["arrow-ipc-optimizations", "build-binary", "mimalloc"]
 
 [dependencies]
 arrow = { workspace = true }
 arrow-flight = { workspace = true }
 async-trait = { workspace = true }
-ballista-core = { path = "../core", version = "50.0.0" }
+ballista-core = { path = "../core", version = "52.0.0" }
 clap = { workspace = true, optional = true }
 dashmap = { workspace = true }
 datafusion = { workspace = true }
