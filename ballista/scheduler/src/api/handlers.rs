@@ -52,6 +52,7 @@ pub struct JobResponse {
     pub job_id: String,
     pub job_name: String,
     pub job_status: String,
+    pub status: String,
     pub num_stages: usize,
     pub completed_stages: usize,
     pub percent_complete: u8,
@@ -60,6 +61,8 @@ pub struct JobResponse {
 #[derive(Debug, serde::Serialize)]
 struct CancelJobResponse {
     pub cancelled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -127,10 +130,10 @@ pub async fn get_jobs<
         .iter()
         .map(|job| {
             let status = &job.status;
-            let job_status = match &status.status {
-                Some(Status::Queued(_)) => "Queued".to_string(),
-                Some(Status::Running(_)) => "Running".to_string(),
-                Some(Status::Failed(error)) => format!("Failed: {}", error.error),
+            let (plain_status, job_status) = match &status.status {
+                Some(Status::Queued(_)) => ("Queued".to_string(), "Queued".to_string()),
+                Some(Status::Running(_)) => ("Running".to_string(), "Running".to_string()),
+                Some(Status::Failed(error)) => ("Failed".to_string(), format!("Failed: {}", error.error)),
                 Some(Status::Successful(completed)) => {
                     let num_rows = completed
                         .partition_location
@@ -146,13 +149,15 @@ pub async fn get_jobs<
                     } else {
                         "partitions"
                     };
+                    ("Completed".to_string(),
                     format!(
                         "Completed. Produced {} {} containing {} {}. Elapsed time: {} ms.",
                         num_partitions, num_partitions_term, num_rows, num_rows_term,
                         job.end_time - job.start_time
                     )
+                    )
                 }
-                _ => "Invalid State".to_string(),
+                _ => ("Invalid".to_string(), "Invalid State".to_string()),
             };
 
             // calculate progress based on completed stages for now, but we could use completed
@@ -163,6 +168,7 @@ pub async fn get_jobs<
                 job_id: job.job_id.to_string(),
                 job_name: job.job_name.to_string(),
                 job_status,
+                status: plain_status,
                 num_stages: job.num_stages,
                 completed_stages: job.completed_stages,
                 percent_complete,
@@ -180,24 +186,59 @@ pub async fn cancel_job<
     State(data_server): State<Arc<SchedulerServer<T, U>>>,
     Path(job_id): Path<String>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    // 404 if job doesn't exist
-    data_server
+    // 404 if the job doesn't exist
+    let job_status = data_server
         .state
         .task_manager
         .get_job_status(&job_id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|err| {
+            tracing::error!("Error getting job status: {err:?}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    data_server
-        .query_stage_event_loop
-        .get_sender()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .post_event(QueryStageSchedulerEvent::JobCancel(job_id))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    match &job_status.status {
+        None | Some(Status::Queued(_)) | Some(Status::Running(_)) => {
+            data_server
+                .query_stage_event_loop
+                .get_sender()
+                .map_err(|err| {
+                    tracing::error!(
+                        "Error getting query stage event loop sender: {err:?}"
+                    );
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?
+                .post_event(QueryStageSchedulerEvent::JobCancel(job_id))
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(Json(CancelJobResponse { cancelled: true }))
+            Ok((
+                StatusCode::OK,
+                Json(CancelJobResponse {
+                    cancelled: true,
+                    reason: None,
+                }),
+            )
+                .into_response())
+        }
+        Some(Status::Failed(_)) => Ok((
+            StatusCode::CONFLICT,
+            Json(CancelJobResponse {
+                cancelled: false,
+                reason: Some("The job has failed".into()),
+            }),
+        )
+            .into_response()),
+        Some(Status::Successful(_)) => Ok((
+            StatusCode::CONFLICT,
+            Json(CancelJobResponse {
+                cancelled: false,
+                reason: Some("The job is already completed".into()),
+            }),
+        )
+            .into_response()),
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
