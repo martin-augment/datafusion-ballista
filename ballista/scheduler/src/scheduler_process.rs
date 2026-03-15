@@ -18,6 +18,8 @@
 use crate::flight_proxy_service::BallistaFlightProxyService;
 
 use arrow_flight::flight_service_server::FlightServiceServer;
+use axum::Json;
+use axum::response::{IntoResponse, Response};
 use ballista_core::BALLISTA_VERSION;
 use ballista_core::error::BallistaError;
 use ballista_core::extension::BallistaConfigGrpcEndpoint;
@@ -130,17 +132,42 @@ pub async fn start_grpc_service<
     tonic_builder.add_service(ExternalScalerServer::new(scheduler.clone()));
 
     let tonic = tonic_builder.routes().into_axum_router();
-    let tonic = tonic.fallback(|| async { (StatusCode::NOT_FOUND, "404 - Not Found") });
+
+    // registering default handler for unmatched requests
+    let tonic =
+        tonic.fallback(|| async { SchedulerErrorResponse::new(StatusCode::NOT_FOUND) });
 
     #[cfg(feature = "rest-api")]
-    let axum = get_routes(Arc::new(scheduler));
-    #[cfg(feature = "rest-api")]
-    let final_route = axum
-        .merge(tonic)
-        .into_make_service_with_connect_info::<SocketAddr>();
+    let final_route = if config.disable_rest {
+        tonic
+            .route(
+                "/api/{*path}",
+                axum::routing::any(|| async {
+                    SchedulerErrorResponse::with_error(
+                        StatusCode::NOT_FOUND,
+                        "Rest api has been disabled at startup".to_string(),
+                    )
+                }),
+            )
+            .into_make_service_with_connect_info::<SocketAddr>()
+    } else {
+        let axum = get_routes(Arc::new(scheduler));
+        axum.merge(tonic)
+            .into_make_service_with_connect_info::<SocketAddr>()
+    };
 
     #[cfg(not(feature = "rest-api"))]
-    let final_route = tonic.into_make_service_with_connect_info::<SocketAddr>();
+    let final_route = tonic
+        .route(
+            "/api/{*path}",
+            axum::routing::any(|| async {
+                SchedulerErrorResponse::with_error(
+                    StatusCode::NOT_FOUND,
+                    "Rest api has been disabled at compile time".to_string(),
+                )
+            }),
+        )
+        .into_make_service_with_connect_info::<SocketAddr>();
 
     let listener = tokio::net::TcpListener::bind(&address)
         .await
@@ -164,4 +191,40 @@ pub async fn start_server(
         create_scheduler::<LogicalPlanNode, PhysicalPlanNode>(cluster, config).await?;
 
     start_grpc_service(address, scheduler).await
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct SchedulerErrorResponse {
+    #[serde(skip)]
+    status_code: StatusCode,
+    http_code: u16,
+    reason: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl SchedulerErrorResponse {
+    pub(crate) fn new(status_code: StatusCode) -> Self {
+        Self {
+            status_code,
+            reason: status_code.canonical_reason(),
+            http_code: status_code.as_u16(),
+            error: None,
+        }
+    }
+    pub(crate) fn with_error(status_code: StatusCode, error: String) -> Self {
+        Self {
+            status_code,
+            reason: status_code.canonical_reason(),
+            http_code: status_code.as_u16(),
+            error: Some(error),
+        }
+    }
+}
+
+impl IntoResponse for SchedulerErrorResponse {
+    fn into_response(self) -> Response {
+        let status = self.status_code;
+        (status, Json(self)).into_response()
+    }
 }
