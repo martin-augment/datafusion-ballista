@@ -1041,7 +1041,6 @@ dependencies = [
  "aws-credential-types",
  "chrono",
  "clap 4.6.1",
- "dashmap",
  "datafusion",
  "datafusion-proto",
  "datafusion-proto-common",
