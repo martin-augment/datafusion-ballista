@@ -151,11 +151,11 @@ pub struct Config {
         help = "Metric collection policy of this executor instance"
     )]
     pub metric_collection_policy: ExecutorMetricCollectionPolicy,
-    /// Number of second established client connection should be cached (0 means no cache)
+    /// Number of seconds established client connection should be cached (0 means no cache)
     #[arg(
         long,
         default_value_t = 0,
-        help = "Number of second established client connection should be cached (0 means no cache) "
+        help = "Number of seconds established client connection should be cached (0 means no cache) "
     )]
     pub connection_cache: u64,
 }
