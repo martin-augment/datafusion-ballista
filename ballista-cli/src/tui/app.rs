@@ -20,7 +20,9 @@ use crate::tui::{
     TuiError,
     domain::{
         SortOrder,
-        executors::{ExecutorsData, SortColumn as ExecutorsSortColumn},
+        executors::{
+            ExecutorDetailsPopup, ExecutorsData, SortColumn as ExecutorsSortColumn,
+        },
         jobs::{
             CancelJobResult, JobDetails, JobPlansPopup, JobsData, PlanTab,
             SortColumn as JobsSortColumn,
@@ -34,14 +36,14 @@ use crate::tui::{
 };
 use chrono::DateTime;
 use crossterm::event::{KeyCode, KeyEvent};
-use datafusion::common::human_readable_duration;
+use datafusion::common::{human_readable_duration, human_readable_size};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
 use crate::tui::http_client::HttpClient;
 use crate::tui::ui::{
-    load_executors_data, load_job_details, load_job_dot, load_job_stages_popup,
-    load_jobs_data, load_metrics_data,
+    load_executor_details_popup, load_executors_data, load_job_details, load_job_dot,
+    load_job_stages_popup, load_jobs_data, load_metrics_data,
 };
 
 #[derive(Debug, PartialEq)]
@@ -81,6 +83,7 @@ pub(crate) struct App {
     pub job_dot_popup: Option<StagesGraph>,
     pub job_plan_popup: Option<JobPlansPopup>,
     pub job_stages_popup: Option<JobStagesPopup>,
+    pub executor_details_popup: Option<ExecutorDetailsPopup>,
 
     pub http_client: Arc<HttpClient>,
 }
@@ -100,6 +103,7 @@ impl App {
             job_dot_popup: None,
             job_plan_popup: None,
             job_stages_popup: None,
+            executor_details_popup: None,
             executors_data: ExecutorsData::new(),
             jobs_data: JobsData::new(),
             metrics_data: MetricsData::new(),
@@ -261,6 +265,18 @@ impl App {
             return Ok(());
         }
 
+        if let Some(ref mut executor_popup) = self.executor_details_popup {
+            match key.code {
+                KeyCode::Up => executor_popup.scroll_up(),
+                KeyCode::Down => executor_popup.scroll_down(),
+                KeyCode::Esc => {
+                    self.executor_details_popup = None;
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         if self.show_help || self.show_scheduler_info {
             self.show_help = false;
             self.show_scheduler_info = false;
@@ -279,6 +295,9 @@ impl App {
             }
             KeyCode::Enter if self.is_jobs_view() => {
                 self.load_job_stages_popup_data().await;
+            }
+            KeyCode::Enter if self.is_executors_view() => {
+                self.load_executor_details_popup_data().await;
             }
             KeyCode::Char('g') if self.is_jobs_view() => {
                 self.load_job_dot_data().await;
@@ -401,6 +420,17 @@ impl App {
         }
     }
 
+    async fn load_executor_details_popup_data(&self) {
+        if let Some(executor) = self.executors_data.selected_executor() {
+            let executor_id = executor.id.clone();
+            if let Err(e) = load_executor_details_popup(self, &executor_id).await {
+                tracing::error!(
+                    "Failed to load executor details for '{executor_id}': {e:?}"
+                );
+            }
+        }
+    }
+
     async fn load_executors_data(&mut self) {
         if let Err(e) = load_executors_data(self).await {
             tracing::error!("Failed to load executors data on tick: {e:?}");
@@ -506,6 +536,14 @@ impl App {
         self.jobs_data.jobs.len() > 1
     }
 
+    pub fn has_selected_executor(&self) -> bool {
+        self.executors_data.table_state.selected().is_some()
+    }
+
+    pub fn is_executor_details_popup_open(&self) -> bool {
+        self.executor_details_popup.is_some()
+    }
+
     pub fn is_job_stages_popup_open(&self) -> bool {
         self.job_stages_popup.is_some()
     }
@@ -553,6 +591,10 @@ impl App {
         const NANOS_PER_MILLI: u64 = 1_000_000;
         human_readable_duration(duration_ms * NANOS_PER_MILLI)
     }
+
+    pub fn format_size(&self, value: usize) -> String {
+        human_readable_size(value)
+    }
 }
 
 #[cfg(test)]
@@ -562,6 +604,9 @@ mod tests {
     use crate::tui::app::{ExecutorsSortColumn, JobsSortColumn, MetricsSortColumn};
     use crate::tui::domain::{
         SchedulerState, SortOrder,
+        executors::{
+            Executor, ExecutorDetails, ExecutorDetailsPopup, OsInfo, Specification,
+        },
         jobs::Job,
         jobs::stages::{JobStagesPopup, JobStagesResponse},
     };
@@ -807,6 +852,103 @@ mod tests {
         popup.set_tasks_view();
         app.job_stages_popup = Some(popup);
         assert!(!app.is_job_stage_no_details_popup_open());
+    }
+
+    // --- has_selected_executor / is_executor_details_popup_open tests ---
+
+    fn make_executor(id: &str) -> Executor {
+        Executor {
+            host: "host".to_string(),
+            port: 8080,
+            id: id.to_string(),
+            last_seen: 0,
+            specification: Specification { task_slots: 4 },
+            metrics: vec![],
+        }
+    }
+
+    fn make_executor_details(id: &str) -> ExecutorDetails {
+        ExecutorDetails {
+            executor_info: make_executor(id),
+            os_info: OsInfo {
+                kernel_ver: "5.15".to_string(),
+                num_disks: 1,
+                open_files_limit: 1024,
+                os_ver: "Ubuntu 22.04".to_string(),
+                os_ver_long: "Ubuntu 22.04.1 LTS".to_string(),
+                physical_cores: 4,
+                system_name: "Linux".to_string(),
+                total_available_disk_space: 50_000_000_000,
+                total_disk_space: 100_000_000_000,
+            },
+        }
+    }
+
+    #[test]
+    fn has_selected_executor_false_when_no_executors() {
+        let app = make_app();
+        assert!(!app.has_selected_executor());
+    }
+
+    #[test]
+    fn has_selected_executor_false_when_no_selection() {
+        let mut app = make_app();
+        app.executors_data.executors = vec![make_executor("e1")];
+        assert!(!app.has_selected_executor());
+    }
+
+    #[test]
+    fn has_selected_executor_true_when_selected() {
+        let mut app = make_app();
+        app.executors_data.executors = vec![make_executor("e1")];
+        app.executors_data.table_state.select(Some(0));
+        assert!(app.has_selected_executor());
+    }
+
+    #[test]
+    fn is_executor_details_popup_open_false_when_none() {
+        let app = make_app();
+        assert!(!app.is_executor_details_popup_open());
+    }
+
+    #[test]
+    fn is_executor_details_popup_open_true_when_some() {
+        let mut app = make_app();
+        app.executor_details_popup =
+            Some(ExecutorDetailsPopup::new(make_executor_details("e1")));
+        assert!(app.is_executor_details_popup_open());
+    }
+
+    // --- format_size tests ---
+
+    #[test]
+    fn format_size_zero_bytes() {
+        let app = make_app();
+        assert_eq!(app.format_size(0), "0.0 B");
+    }
+
+    #[test]
+    fn format_size_bytes_below_kb_threshold() {
+        let app = make_app();
+        assert_eq!(app.format_size(1024), "1024.0 B");
+    }
+
+    #[test]
+    fn format_size_kilobytes() {
+        let app = make_app();
+        assert_eq!(app.format_size(2 * 1024), "2.0 KB");
+    }
+
+    #[test]
+    fn format_size_megabytes() {
+        let app = make_app();
+        assert_eq!(app.format_size(2 * 1024 * 1024), "2.0 MB");
+    }
+
+    #[test]
+    fn format_size_gigabytes() {
+        let app = make_app();
+        assert_eq!(app.format_size(2 * 1024 * 1024 * 1024), "2.0 GB");
     }
 
     // --- is_selected_job_cancelable tests ---
