@@ -26,17 +26,44 @@ jobs:
   build_docker:
     name: Run Build Docker Script
     runs-on: ubuntu-latest
+    container:
+      image: amd64/rust
     steps:
+      - name: Install dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt update
+          apt install -y ca-certificates curl nodejs
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          chmod a+r /etc/apt/keyrings/docker.asc
+
+          # Add the repository to Apt sources:
+          tee /etc/apt/sources.list.d/docker.sources <<EOF
+          Types: deb
+          URIs: https://download.docker.com/linux/debian
+          Suites: $(. /etc/os-release && echo "$VERSION_CODENAME")
+          Components: stable
+          Architectures: $(dpkg --print-architecture)
+          Signed-By: /etc/apt/keyrings/docker.asc
+          EOF
+
+          apt update
+          apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
       - name: Checkout
         uses: actions/checkout@v6.0.2
-      - name: Installs Rust and Cargo
-        run: curl -y --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-      - name: Install protoc
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+        with:
+          fetch-depth: 1
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-builder
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
       - name: Run script
         run: |
+          export PATH=$PATH:$HOME/d/protoc/bin
+          git config --global --add safe.directory $PWD
+          git config --global --add safe.directory /__w/datafusion-ballista/datafusion-ballista
 
           ./dev/build-ballista-docker.sh
 
@@ -44,11 +71,11 @@ jobs:
           docker tag apache/datafusion-ballista-executor:latest ghcr.io/apache/datafusion-ballista-executor:latest
           docker tag apache/datafusion-ballista-scheduler:latest ghcr.io/apache/datafusion-ballista-scheduler:latest
 
-          # release dockers only when there is a release tag 
+          # release dockers only when there is a release tag
           export DOCKER_TAG="$(git describe --exact-match --tags $(git log -n1 --pretty='%h') || echo '')"
           if [[ $DOCKER_TAG =~ ^[0-9\.]+(-rc[0-9]+)?$ ]]
           then
-            
+
             docker login ghcr.io -u $DOCKER_USER -p "$DOCKER_PASS"
 
             echo "publishing docker tag $DOCKER_TAG"
@@ -56,7 +83,7 @@ jobs:
             docker tag apache/datafusion-ballista-standalone:latest ghcr.io/apache/datafusion-ballista-standalone:$DOCKER_TAG
             docker tag apache/datafusion-ballista-executor:latest ghcr.io/apache/datafusion-ballista-executor:$DOCKER_TAG
             docker tag apache/datafusion-ballista-scheduler:latest ghcr.io/apache/datafusion-ballista-scheduler:$DOCKER_TAG
-            
+
             docker push ghcr.io/apache/datafusion-ballista-standalone:$DOCKER_TAG
             docker push ghcr.io/apache/datafusion-ballista-executor:$DOCKER_TAG
             docker push ghcr.io/apache/datafusion-ballista-scheduler:$DOCKER_TAG
