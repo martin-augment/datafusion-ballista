@@ -69,18 +69,13 @@ struct SchedulerVersionResponse {
 }
 
 #[derive(Debug, serde::Serialize)]
-pub struct ExecutorBriefResponse {
+pub struct ExecutorResponse {
     pub id: String,
     pub host: String,
     pub port: u16,
     pub last_seen: Option<u128>,
     pub specification: ExecutorSpecification,
     pub metrics: Vec<ExecutorMetricResponse>,
-}
-
-#[derive(Debug, serde::Serialize)]
-pub struct ExecutorDetailedResponse {
-    pub executor_info: ExecutorBriefResponse,
     pub os_info: ExecutorOperatingSystemSpecification,
 }
 
@@ -253,13 +248,13 @@ pub async fn get_executors<
     State(data_server): State<Arc<SchedulerServer<T, U>>>,
 ) -> impl IntoResponse {
     let state = &data_server.state;
-    let executors: Vec<ExecutorBriefResponse> = state
+    let executors: Vec<ExecutorResponse> = state
         .executor_manager
         .get_executors_state()
         .await
         .unwrap_or_default()
         .into_iter()
-        .map(|(metadata, duration, metrics)| ExecutorBriefResponse {
+        .map(|(metadata, duration, metrics)| ExecutorResponse {
             id: metadata.id,
             host: metadata.host,
             port: metadata.port,
@@ -269,6 +264,7 @@ pub async fn get_executors<
                 .into_iter()
                 .filter_map(ExecutorMetricResponse::from_proto)
                 .collect(),
+            os_info: metadata.os_info,
         })
         .collect();
 
@@ -290,23 +286,17 @@ pub async fn get_executor_info<
         .unwrap_or_default()
         .into_iter()
         .find(|(metadata, _, _)| metadata.id == executor_id)
-        .map(|(metadata, duration, metrics)| {
-            let executor_info = ExecutorBriefResponse {
-                id: metadata.id,
-                host: metadata.host,
-                port: metadata.port,
-                last_seen: duration.map(|d| d.as_millis()),
-                specification: metadata.specification,
-                metrics: metrics
-                    .into_iter()
-                    .filter_map(ExecutorMetricResponse::from_proto)
-                    .collect(),
-            };
-
-            ExecutorDetailedResponse {
-                executor_info,
-                os_info: metadata.os_info,
-            }
+        .map(|(metadata, duration, metrics)| ExecutorResponse {
+            id: metadata.id,
+            host: metadata.host,
+            port: metadata.port,
+            last_seen: duration.map(|d| d.as_millis()),
+            specification: metadata.specification,
+            metrics: metrics
+                .into_iter()
+                .filter_map(ExecutorMetricResponse::from_proto)
+                .collect(),
+            os_info: metadata.os_info,
         });
 
     executor_info
@@ -322,7 +312,7 @@ pub async fn get_jobs<
 ) -> Result<impl IntoResponse, SchedulerErrorResponse> {
     let state = &data_server.state;
 
-    let jobs = state.task_manager.get_jobs().await.map_err(|e| {
+    let jobs = state.task_manager.get_all_jobs().await.map_err(|e| {
         tracing::error!("Error occurred while getting jobs, reason: {e:?}");
         SchedulerErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR)
     })?;
@@ -337,8 +327,11 @@ pub async fn get_jobs<
 
             // calculate progress based on completed stages for now, but we could use completed
             // tasks in the future to make this more accurate
-            let percent_complete =
-                ((job.completed_stages as f32 / job.num_stages as f32) * 100_f32) as u8;
+            let percent_complete = if job.num_stages == 0 {
+                0
+            } else {
+                ((job.completed_stages as f32 / job.num_stages as f32) * 100_f32) as u8
+            };
             JobResponse {
                 job_id: job.job_id.to_string(),
                 job_name: job.job_name.to_string(),
