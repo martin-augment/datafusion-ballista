@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod dot_parser;
+pub(crate) mod dot_parser;
 pub mod job_dot_popup;
 pub mod job_plan_popup;
 pub mod job_stages_popup;
@@ -24,12 +24,14 @@ pub mod stage_tasks_popup;
 
 use crate::tui::{
     TuiResult,
+    event::{Event, UiData},
+};
+use crate::tui::{
     app::App,
     domain::{
         SortOrder,
         jobs::{Job, SortColumn},
     },
-    event::{Event, UiData},
     ui::search_box::render_search_box,
     ui::vertical_scrollbar::render_scrollbar,
 };
