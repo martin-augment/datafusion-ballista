@@ -18,6 +18,7 @@
 pub mod coalesce_partitions;
 pub mod datafusion_patch;
 pub mod distributed_exchange;
+pub mod join_info;
 pub mod propagate_empty;
 
 pub use coalesce_partitions::*;
