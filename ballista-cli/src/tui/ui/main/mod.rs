@@ -23,6 +23,8 @@ pub use executors::{
     executor_details_popup, load_executor_details_popup, load_executors_data,
     render_executors,
 };
+#[cfg(feature = "web")]
+pub(crate) use jobs::dot_parser;
 pub use jobs::{
     job_dot_popup, job_plan_popup, job_stages_popup, load_job_details, load_job_dot,
     load_job_stages_popup, load_jobs_data, render_jobs, stage_plan_popup,

@@ -16,6 +16,7 @@ use axum::{Router, routing::get};
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
 use std::sync::Arc;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 /// All routes configured for rest-api.
 pub fn get_routes<
@@ -57,5 +58,9 @@ pub fn get_routes<
         get(handlers::get_job_svg_graph::<T, U>),
     );
 
-    router.with_state(scheduler_server)
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::exact("http://localhost:8080".parse().unwrap()))
+        .allow_methods([http::Method::GET, http::Method::PATCH]);
+
+    router.with_state(scheduler_server).layer(cors)
 }

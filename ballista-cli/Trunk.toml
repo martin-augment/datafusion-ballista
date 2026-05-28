@@ -1,5 +1,3 @@
-#!/usr/bin/env bash
-#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -17,12 +15,18 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set -ex
-cargo clippy --all-targets --package ballista-core --all-features -- -D warnings
-cargo clippy --all-targets --package ballista-scheduler --all-features -- -D warnings
-cargo clippy --all-targets --package ballista-executor --all-features -- -D warnings
-cargo clippy --all-targets --package ballista --all-features -- -D warnings
-cargo clippy --all-targets --package ballista-cli --no-default-features --features cli,tui -- -D warnings
-#cargo clippy --all-targets --package ballista-cli --no-default-features --features web -- -D warnings
-cargo clippy --all-targets --package ballista-examples --all-features -- -D warnings
-cargo clippy --all-targets --package ballista-benchmarks --all-features -- -D warnings
+[build]
+target = "ballista-web-tui.html"
+dist = "../target/web-tui"
+
+[watch]
+ignore = []
+
+[[hooks]]
+stage = "build"
+command = "sh"
+command_arguments = ["-c", "cp -f ./src/tui/ui/header/ballista-logo.svg $TRUNK_STAGING_DIR/"]
+
+[hooks.windows]
+command = "cmd"
+command_arguments = ["/c", "copy .\\src\\tui\\ui\\header\\ballista-logo.svg %TRUNK_STAGING_DIR%"]

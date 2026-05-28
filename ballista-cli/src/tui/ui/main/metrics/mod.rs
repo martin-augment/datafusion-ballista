@@ -41,13 +41,10 @@ use ratatui::{
 };
 
 pub async fn load_metrics_data(app: &App) -> TuiResult<()> {
-    let metrics = match app.http_client.get_metrics().await {
-        Ok(metrics) => metrics,
-        Err(e) => {
-            tracing::error!("Failed to load the metrics: {e:?}");
-            Vec::new()
-        }
-    };
+    let metrics = app.http_client.get_metrics().await.unwrap_or_else(|e| {
+        tracing::error!("Failed to load the metrics: {e:?}");
+        Vec::new()
+    });
 
     app.send_event(Event::DataLoaded {
         data: UiData::Metrics(metrics),
@@ -132,7 +129,10 @@ fn render_metrics_table(
     metrics: &[&Metric],
     state: &mut TableState,
 ) {
-    let header_style = Style::default().fg(Color::Yellow).bg(Color::Black);
+    let header_style = Style::default()
+        .fg(Color::LightYellow)
+        .bg(Color::Black)
+        .bold();
 
     let sort_column = &app.metrics_data.sort_column;
     let sort_order = &app.metrics_data.sort_order;

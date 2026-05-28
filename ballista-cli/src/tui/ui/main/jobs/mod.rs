@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod dot_parser;
+pub(crate) mod dot_parser;
 pub mod job_dot_popup;
 pub mod job_plan_popup;
 pub mod job_stages_popup;
