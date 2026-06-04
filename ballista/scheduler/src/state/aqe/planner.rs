@@ -14,13 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use crate::physical_optimizer::filter_pushdown::FilterPushdown;
 use crate::state::aqe::adapter::BallistaAdapter;
 use crate::state::aqe::execution_plan::{AdaptiveDatafusionExec, ExchangeExec};
+use crate::state::aqe::optimizer_rule::chaos_exec::ChaosCreatingRule;
 use crate::state::aqe::optimizer_rule::{
     CoalescePartitionsRule, DelayJoinSelectionRule, DistributedExchangeRule,
-    PropagateEmptyExecRule, SelectJoinRule, WarnOnDuplicateExecRule,
+    PropagateEmptyExecRule, SelectJoinRule,
 };
-
 use crate::state::distributed_explain::handle_explain_plan;
 use crate::state::execution_stage::StageOutput;
 use ballista_core::execution_plans::ShuffleWriter;
@@ -32,7 +33,6 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::{SessionState, SessionStateBuilder};
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
 use datafusion::physical_planner::DefaultPhysicalPlanner;
 use datafusion::prelude::SessionConfig;
@@ -157,9 +157,10 @@ impl AdaptivePlanner {
         // this optimizer set will be executed only once, before
         // running standard set of optimizers, which will
         // after each stage.
+        let plan_id_generator = Arc::new(AtomicUsize::new(0));
         let state = Self::create_session_state(
             ctx.state().config(),
-            Self::plan_preparation_optimizers(),
+            Self::plan_preparation_optimizers(plan_id_generator.clone()),
         );
 
         let plan = state.create_physical_plan(logical_plan).await?;
@@ -171,7 +172,7 @@ impl AdaptivePlanner {
             ctx.state().config(),
             plan,
             job_name,
-            Self::default_optimizers(Arc::new(AtomicUsize::new(0))),
+            Self::default_optimizers(plan_id_generator),
         )
     }
     /// Cancels a stage by its ID.
@@ -493,28 +494,47 @@ impl AdaptivePlanner {
         // select actual join implementation based on current runtime information
         physical_optimizers
             .push(Arc::new(SelectJoinRule::new(plan_id_generator.clone())));
-        // add default set
-        physical_optimizers.extend(PhysicalOptimizer::new().rules);
+
+        // add default datafusion set of optimizers
+        // physical_optimizers.extend(
+        //     datafusion::physical_optimizer::optimizer::PhysicalOptimizer::new().rules,
+        // );
+        //
+        physical_optimizers.extend(Self::datafusion_optimizers());
 
         // `DistributedExchangeRule` should be the last plan mutator rule in the chain
         physical_optimizers
             .push(Arc::new(DistributedExchangeRule::new(plan_id_generator)));
-        // we should remove it at the later stage this is just temporary
-        // to detect possible duplicate execs.
-        // rule does not mutate plan hance it can go after `DistributedExchangeRule`
-        physical_optimizers.push(Arc::new(WarnOnDuplicateExecRule::default()));
-
-        // `CoalescePartitionsRule` is invoked per-stage in `actionable_stages()`
-        // rather than registered here, so each invocation sees only one stage's
-        // plan and forms an alignment group scoped to that stage's inputs.
 
         physical_optimizers
     }
 
+    // at the moment we create default set of optimizers
+    // ```
+    // physical_optimizers.extend(PhysicalOptimizer::new().rules);
+    // ```
+    // as there are issues with some of them
+    // TODO: replace this once we update to datafusion 55
+    fn datafusion_optimizers() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
+        datafusion::physical_optimizer::optimizer::PhysicalOptimizer::new()
+            .rules
+            .into_iter()
+            .map(|r| match r.name() {
+                "FilterPushdown" => Arc::new(FilterPushdown::new()),
+                _ => r,
+            })
+            .collect()
+    }
+
     /// set of rules which will be executed ONCE before
     /// running standard set of physical optimizers
-    fn plan_preparation_optimizers() -> Vec<PhysicalOptimizerRuleRef> {
-        vec![Arc::new(DelayJoinSelectionRule::default())]
+    fn plan_preparation_optimizers(
+        plan_id_generator: Arc<AtomicUsize>,
+    ) -> Vec<PhysicalOptimizerRuleRef> {
+        vec![
+            Arc::new(DelayJoinSelectionRule::new(plan_id_generator)),
+            Arc::new(ChaosCreatingRule::default()),
+        ]
     }
 
     /// Creates a session state with the given configuration and optimizer rules.
