@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
+#![allow(unfulfilled_lint_expectations)]
 use ratatui::widgets::{ScrollbarState, TableState};
 use serde::Deserialize;
 
@@ -67,17 +67,33 @@ pub struct TaskPercentiles {
     pub p75: u64,
 }
 
+#[derive(Debug, Default)]
+pub struct PlanCache {
+    pub default: Option<JobStagesResponse>,
+    pub tree: Option<JobStagesResponse>,
+    pub metrics: Option<JobStagesResponse>,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum StageDetailsView {
     None,
     Tasks,
-    Plan,
+    Plan(StagePlanTab),
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum StagePlanTab {
+    Default,
+    Tree,
+    Metrics,
 }
 
 #[derive(Debug)]
 pub struct JobStagesPopup {
     pub job_id: String,
     pub stages: JobStagesResponse,
+    pub plan_cache: PlanCache,
     pub table_state: TableState,
     pub scrollbar_state: ScrollbarState,
     pub tasks_table_state: TableState,
@@ -92,6 +108,10 @@ impl JobStagesPopup {
         Self {
             job_id,
             scrollbar_state: ScrollbarState::new(stages.stages.len()),
+            plan_cache: PlanCache {
+                default: Some(stages.clone()),
+                ..Default::default()
+            },
             stages,
             table_state: TableState::default(),
             tasks_table_state: TableState::default(),
@@ -99,6 +119,36 @@ impl JobStagesPopup {
             details_view: StageDetailsView::None,
             plan_vertical_scroll_position: 0,
             plan_horizontal_scroll_position: 0,
+        }
+    }
+
+    pub fn cache_plan_response(&mut self, fmt: StagePlanTab, resp: JobStagesResponse) {
+        match fmt {
+            StagePlanTab::Default => self.plan_cache.default = Some(resp.clone()),
+            StagePlanTab::Tree => self.plan_cache.tree = Some(resp.clone()),
+            StagePlanTab::Metrics => self.plan_cache.metrics = Some(resp.clone()),
+        }
+        // If we're currently on that tab, update the live stages too so the
+        // selection / scroll state is preserved.
+        let active_fmt = self.active_plan_format();
+        if active_fmt == Some(fmt) {
+            self.stages = resp;
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn cached_response(&self, tab: &StagePlanTab) -> Option<JobStagesResponse> {
+        match tab {
+            StagePlanTab::Default => self.plan_cache.default.clone(),
+            StagePlanTab::Tree => self.plan_cache.tree.clone(),
+            StagePlanTab::Metrics => self.plan_cache.metrics.clone(),
+        }
+    }
+
+    pub fn active_plan_format(&self) -> Option<StagePlanTab> {
+        match &self.details_view {
+            StageDetailsView::Plan(tab) => Some(tab.clone()),
+            _ => None,
         }
     }
 
@@ -117,7 +167,7 @@ impl JobStagesPopup {
     }
 
     pub fn set_plan_view(&mut self) {
-        self.details_view = StageDetailsView::Plan;
+        self.details_view = StageDetailsView::Plan(StagePlanTab::Default);
         self.plan_vertical_scroll_position = 0;
         self.plan_horizontal_scroll_position = 0;
     }
@@ -135,7 +185,21 @@ impl JobStagesPopup {
     }
 
     pub fn is_plan_view(&self) -> bool {
-        self.details_view == StageDetailsView::Plan
+        matches!(self.details_view, StageDetailsView::Plan(_))
+    }
+
+    #[allow(dead_code)]
+    pub fn set_tab(&mut self, tab: StagePlanTab) -> Option<StagePlanTab> {
+        self.details_view = StageDetailsView::Plan(tab.clone());
+        self.plan_vertical_scroll_position = 0;
+        self.plan_horizontal_scroll_position = 0;
+
+        if let Some(cached) = self.cached_response(&tab) {
+            self.stages = cached;
+            None
+        } else {
+            Some(tab)
+        }
     }
 
     pub fn scroll_down(&mut self) {
