@@ -25,7 +25,6 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 
 use crate::config::SchedulerConfig;
 use crate::metrics::SchedulerMetricsCollector;
@@ -80,7 +79,7 @@ const TEST_SCHEDULER_NAME: &str = "localhost:50050";
 #[derive(Debug)]
 pub struct ExplodingTableProvider;
 
-#[async_trait]
+#[async_trait::async_trait]
 impl TableProvider for ExplodingTableProvider {
     fn as_any(&self) -> &dyn Any {
         self
@@ -346,7 +345,7 @@ impl VirtualExecutor {
 #[derive(Default)]
 pub struct BlackholeTaskLauncher {}
 
-#[async_trait]
+#[async_trait::async_trait]
 impl TaskLauncher for BlackholeTaskLauncher {
     async fn launch_tasks(
         &self,
