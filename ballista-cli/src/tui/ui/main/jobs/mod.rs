@@ -81,11 +81,12 @@ pub async fn load_job_dot(app: &App, job_id: &str) -> TuiResult<()> {
     }
 }
 
+/// Loading whole job's stages to render the popup window
 #[cfg(not(feature = "web"))]
 pub async fn load_job_stages_popup(app: &App, job_id: &str) -> TuiResult<()> {
     let mut stages = app
         .http_client
-        .get_job_stages(job_id)
+        .get_job_stages(job_id, None)
         .await
         .inspect(|stages| tracing::trace!("Loaded stages for job '{job_id}': {stages:?}"))
         .inspect_err(|e| {
@@ -102,9 +103,43 @@ pub async fn load_job_stages_popup(app: &App, job_id: &str) -> TuiResult<()> {
     .await
 }
 
+/// Loading stage's plan to render the popup window
+#[cfg(not(feature = "web"))]
+pub async fn load_stage_plan(
+    app: &App,
+    job_id: &str,
+    tab: crate::tui::domain::jobs::stages::StagePlanTab,
+) -> TuiResult<()> {
+    use crate::tui::domain::jobs::stages::StagePlanTab;
+
+    let fmt = match tab {
+        StagePlanTab::Default => Some(""),
+        StagePlanTab::Tree => Some("tree"),
+        StagePlanTab::Metrics => Some("metrics"),
+    };
+
+    let mut stages = app
+        .http_client
+        .get_job_stages(job_id, fmt)
+        .await
+        .inspect(|s| tracing::trace!("Loaded {fmt:?} plan for job '{job_id}': {s:?}"))
+        .inspect_err(|e| {
+            tracing::error!("Failed to load {fmt:?} plan for job '{job_id}': {e:?}")
+        })?;
+
+    stages
+        .stages
+        .sort_by_key(|s| s.id.parse::<u64>().unwrap_or(u64::MAX));
+
+    app.send_event(Event::DataLoaded {
+        data: UiData::JobStagesPlanData(tab, stages),
+    })
+    .await
+}
+
 #[cfg(not(feature = "web"))]
 pub async fn load_job_details(app: &App, job_id: &str) -> TuiResult<()> {
-    let details = match app.http_client.get_job_details(job_id).await {
+    let details = match app.http_client.get_job_details(job_id, None).await {
         Ok(d) => d,
         Err(e) => {
             tracing::error!("Failed to load job details for {job_id}: {e:?}");
