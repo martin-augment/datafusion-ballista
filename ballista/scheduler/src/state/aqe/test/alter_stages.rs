@@ -57,7 +57,7 @@ async fn should_propagate_empty_stage() -> datafusion::error::Result<()> {
     let mut planner = AdaptivePlanner::try_from_plan(
         ctx.state().config(),
         plan,
-        "test_job".to_string(),
+        "test_job".to_owned().into(),
     )?;
 
     let stages = planner.runnable_stages()?.unwrap();
@@ -120,7 +120,7 @@ async fn should_propagate_empty_stage_and_remove() -> datafusion::error::Result<
     let mut planner = AdaptivePlanner::try_from_plan(
         ctx.state().config(),
         plan,
-        "test_job".to_string(),
+        "test_job".to_owned().into(),
     )?;
 
     assert_plan!(planner.current_plan(),  @ r"
@@ -189,7 +189,7 @@ async fn should_support_join_re_ordering() -> datafusion::error::Result<()> {
     let mut planner = AdaptivePlanner::try_from_plan(
         ctx.state().config(),
         join,
-        "test_job".to_string(),
+        "test_job".to_owned().into(),
     )?;
 
     assert_plan!(planner.current_plan(),  @ r"
@@ -289,7 +289,7 @@ async fn should_support_cross_join() -> datafusion::error::Result<()> {
     let mut planner = AdaptivePlanner::try_from_plan(
         ctx.state().config(),
         join,
-        "test_job".to_string(),
+        "test_job".to_owned().into(),
     )?;
 
     //
@@ -395,7 +395,7 @@ async fn should_cancel_the_stage() -> datafusion::error::Result<()> {
     let mut planner = AdaptivePlanner::try_from_plan(
         ctx.state().config(),
         join,
-        "test_job".to_string(),
+        "test_job".to_owned().into(),
     )?;
 
     let (stages, cancellable) = planner.actionable_stages()?;
@@ -530,7 +530,7 @@ fn small_statistics_exchange() -> Vec<Vec<PartitionLocation>> {
         // next few properties are generic values
         map_partition_id: 0,
         partition_id: PartitionId {
-            job_id: "".to_string(),
+            job_id: "".to_owned().into(),
             stage_id: 0,
             partition_id: 0,
         },
@@ -562,7 +562,7 @@ fn big_statistics_exchange() -> Vec<Vec<PartitionLocation>> {
         // next few properties are generic values
         map_partition_id: 0,
         partition_id: PartitionId {
-            job_id: "".to_string(),
+            job_id: "".to_owned().into(),
             stage_id: 0,
             partition_id: 0,
         },

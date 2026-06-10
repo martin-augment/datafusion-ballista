@@ -18,11 +18,11 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ballista_core::JobStatusSubscriber;
 use ballista_core::error::Result;
 use ballista_core::event_loop::{EventLoop, EventSender};
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::TaskStatus;
+use ballista_core::{JobId, JobName, JobStatusSubscriber};
 
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::LogicalPlan;
@@ -186,7 +186,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         self.query_stage_scheduler.metrics_collector()
     }
     /// Cancels job for given job_id
-    pub async fn cancel_job(&self, job_id: String) -> Result<()> {
+    pub async fn cancel_job(&self, job_id: JobId) -> Result<()> {
         log::debug!("Received cancellation request for job {job_id}");
 
         self.query_stage_event_loop
@@ -199,7 +199,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
 
     pub(crate) async fn fail_job(
         &self,
-        job_id: String,
+        job_id: JobId,
         fail_message: String,
     ) -> Result<()> {
         log::debug!("Received fail job request for job {job_id}");
@@ -220,17 +220,17 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
     /// Submits a job to executor returning job_id
     pub async fn submit_job(
         &self,
-        job_name: &str,
+        job_name: &JobName,
         ctx: Arc<SessionContext>,
         plan: &LogicalPlan,
         subscriber: Option<JobStatusSubscriber>,
-    ) -> Result<String> {
+    ) -> Result<JobId> {
         log::debug!("Received submit request for job {job_name}");
         let job_id = self.state.task_manager.generate_job_id();
         self.query_stage_event_loop
             .get_sender()?
             .post_event(QueryStageSchedulerEvent::JobQueued {
-                job_id: job_id.to_owned(),
+                job_id: job_id.clone(),
                 job_name: job_name.to_owned(),
                 session_ctx: ctx,
                 plan: Box::new(plan.clone()),
@@ -413,6 +413,7 @@ mod test {
 
     use ballista_core::extension::SessionConfigExt;
     use ballista_core::serde::protobuf::job_status::Status;
+    use ballista_core::{JobId, JobName};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::functions_aggregate::sum::sum;
     use datafusion::logical_expr::{LogicalPlan, col};
@@ -422,10 +423,9 @@ mod test {
     use datafusion_proto::protobuf::LogicalPlanNode;
     use datafusion_proto::protobuf::PhysicalPlanNode;
 
+    use crate::config::SchedulerConfig;
     use ballista_core::config::TaskSchedulingPolicy;
     use ballista_core::error::Result;
-
-    use crate::config::SchedulerConfig;
 
     use ballista_core::serde::BallistaCodec;
     use ballista_core::serde::protobuf::{
@@ -473,18 +473,19 @@ mod test {
             .create_or_update_session("session_id", &config)
             .await?;
 
-        let job_id = "job";
+        let job_id: JobId = "job".to_owned().into();
 
         // Enqueue job
-        scheduler
-            .state
-            .task_manager
-            .queue_job(job_id, "", timestamp_millis())?;
+        scheduler.state.task_manager.queue_job(
+            &job_id,
+            &JobName::new(""),
+            timestamp_millis(),
+        )?;
 
         // Submit job
         scheduler
             .state
-            .submit_job(job_id, "", ctx, &plan, 0, None)
+            .submit_job(&job_id, &JobName::new(""), ctx, &plan, 0, None)
             .await
             .expect("submitting plan");
 
@@ -492,7 +493,7 @@ mod test {
         while let Some(graph) = scheduler
             .state
             .task_manager
-            .get_active_execution_graph(job_id)
+            .get_active_execution_graph(&job_id)
         {
             let task = {
                 let mut graph = graph.write().await;
@@ -517,7 +518,7 @@ mod test {
                 // Complete the task
                 let task_status = TaskStatus {
                     task_id: task.task_id as u32,
-                    job_id: task.partition.job_id.clone(),
+                    job_id: task.partition.job_id.clone().into(),
                     stage_id: task.partition.stage_id as u32,
                     stage_attempt_num: task.stage_attempt_num as u32,
                     partition_id: task.partition.partition_id as u32,
@@ -543,7 +544,7 @@ mod test {
         let final_graph = scheduler
             .state
             .task_manager
-            .get_active_execution_graph(job_id)
+            .get_active_execution_graph(&job_id)
             .expect("Fail to find graph in the cache");
 
         let final_graph = final_graph.read().await;
@@ -574,7 +575,10 @@ mod test {
         )
         .await?;
 
-        let (status, job_id) = test.run("", &plan).await.expect("running plan");
+        let (status, job_id) = test
+            .run(&JobName::new(""), &plan)
+            .await
+            .expect("running plan");
 
         match status.status {
             Some(job_status::Status::Successful(SuccessfulJob {
@@ -614,7 +618,7 @@ mod test {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
         let (status, job_id) = test
-            .run_with_subscriber("", &plan, Some(tx))
+            .run_with_subscriber(&JobName::new(""), &plan, Some(tx))
             .await
             .expect("running plan");
 
@@ -707,7 +711,10 @@ mod test {
         )
         .await?;
 
-        let (status, job_id) = test.run("", &plan).await.expect("running plan");
+        let (status, job_id) = test
+            .run(&JobName::new(""), &plan)
+            .await
+            .expect("running plan");
 
         assert!(
             matches!(
@@ -784,7 +791,7 @@ mod test {
         .await?;
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let (status, job_id) = test
-            .run_with_subscriber("", &plan, Some(tx))
+            .run_with_subscriber(&JobName::new(""), &plan, Some(tx))
             .await
             .expect("running plan");
 
@@ -848,7 +855,7 @@ mod test {
             .into_optimized_plan()?;
 
         // This should fail when we try and create the physical plan
-        let (status, job_id) = test.run("", &plan).await?;
+        let (status, job_id) = test.run(&JobName::new(""), &plan).await?;
 
         assert!(
             matches!(
@@ -894,7 +901,9 @@ mod test {
             .into_optimized_plan()?;
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         // This should fail when we try and create the physical plan
-        let (status, job_id) = test.run_with_subscriber("", &plan, Some(tx)).await?;
+        let (status, job_id) = test
+            .run_with_subscriber(&JobName::new(""), &plan, Some(tx))
+            .await?;
 
         assert!(
             matches!(

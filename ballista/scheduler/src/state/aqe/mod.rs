@@ -34,6 +34,7 @@ use ballista_core::serde::protobuf::{
     job_status, task_status,
 };
 use ballista_core::serde::scheduler::{ExecutorMetadata, PartitionLocation};
+use ballista_core::{JobId, JobName};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::ExecutionPlan;
@@ -94,9 +95,9 @@ pub(crate) struct AdaptiveExecutionGraph {
     /// Adaptive Planner to be used with this execution graph
     planner: AdaptivePlanner,
     /// ID for this job
-    job_id: String,
+    job_id: JobId,
     /// Job name, can be empty string
-    job_name: String,
+    job_name: JobName,
     /// Session ID for this job
     session_id: String,
     /// Status of this job
@@ -131,8 +132,8 @@ impl AdaptiveExecutionGraph {
     #[allow(clippy::too_many_arguments)]
     pub async fn try_new(
         scheduler_id: &str,
-        job_id: &str,
-        job_name: &str,
+        job_id: &JobId,
+        job_name: &JobName,
         ctx: &SessionContext,
         logical_plan: &LogicalPlan,
         queued_at: u64,
@@ -172,8 +173,8 @@ impl AdaptiveExecutionGraph {
         Ok(Self {
             planner,
             scheduler_id: Some(scheduler_id.to_string()),
-            job_id: job_id.to_string(),
-            job_name: job_name.to_string(),
+            job_id: job_id.to_owned(),
+            job_name: job_name.to_owned(),
             session_id: session_id.to_string(),
 
             status: JobStatus {
@@ -503,12 +504,12 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
         Box::new(self.clone())
     }
 
-    fn job_id(&self) -> &str {
-        self.job_id.as_str()
+    fn job_id(&self) -> &JobId {
+        &self.job_id
     }
 
-    fn job_name(&self) -> &str {
-        self.job_name.as_str()
+    fn job_name(&self) -> &JobName {
+        &self.job_name
     }
 
     fn session_id(&self) -> &str {
@@ -1175,8 +1176,8 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
         self.end_time = timestamp_millis();
 
         self.status = JobStatus {
-            job_id: self.job_id.clone(),
-            job_name: self.job_name.clone(),
+            job_id: self.job_id.clone().into(),
+            job_name: self.job_name.clone().into(),
             status: Some(Status::Failed(FailedJob {
                 error,
                 queued_at: self.queued_at,
@@ -1204,8 +1205,8 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
         self.end_time = timestamp_millis();
 
         self.status = JobStatus {
-            job_id: self.job_id.clone(),
-            job_name: self.job_name.clone(),
+            job_id: self.job_id.clone().into(),
+            job_name: self.job_name.clone().into(),
             status: Some(job_status::Status::Successful(SuccessfulJob {
                 partition_location,
 
