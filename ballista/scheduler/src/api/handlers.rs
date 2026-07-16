@@ -17,6 +17,7 @@ use crate::state::execution_graph_dot::ExecutionGraphDot;
 use crate::state::execution_stage::TaskInfo;
 use crate::{api::SchedulerErrorResponse, scheduler_server::SchedulerServer};
 use axum::extract::Query;
+use axum::response::Redirect;
 use axum::{
     Json,
     extract::{Path, State},
@@ -46,7 +47,7 @@ use graphviz_rust::{
     exec,
     printer::PrinterContext,
 };
-use http::{StatusCode, header::CONTENT_TYPE};
+use http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -225,6 +226,36 @@ pub enum PlanFormat {
     Tree,
     /// ?plan_format=metrics => indent with aggregated metrics   
     Metrics,
+}
+
+/// A handler for GET requests to the root (`/`).
+/// It redirects to https://nightlies.apache.org/datafusion/ballista/tui/<BALLISTA_VERSION>/
+/// forwarding any query parameters
+pub async fn get_root(
+    header_map: HeaderMap,
+    Query(mut params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Redirect, (StatusCode, String)> {
+    const NIGHTLIES_URL: &str = "https://nightlies.apache.org/datafusion/ballista/tui";
+
+    let ballista_scheduler_url =
+        params.remove("ballista_scheduler_url").unwrap_or_else(|| {
+            let default_scheduler_url = "localhost:50050";
+            let scheduler_url = header_map
+                .get("host")
+                .map(|hv| hv.to_str().unwrap_or(default_scheduler_url))
+                .unwrap_or(default_scheduler_url);
+            format!("http://{scheduler_url}")
+        });
+
+    let mut target = format!(
+        "{NIGHTLIES_URL}/{BALLISTA_VERSION}/?ballista_scheduler_url={ballista_scheduler_url}",
+    );
+
+    for (k, v) in params.iter() {
+        target.push_str(format!("&{}={}", k, v).as_str());
+    }
+
+    Ok(Redirect::temporary(&target))
 }
 
 pub async fn get_scheduler_state<
@@ -546,7 +577,7 @@ pub async fn get_query_stages<
                         let metrics = running_stage.stage_metrics.as_deref().unwrap_or(&[]);
                         summary.stage_plan = Some(match plan_format {
                             PlanFormat::Default => displayable(running_stage.plan.as_ref()).indent(false).to_string(),
-                            PlanFormat::Tree    => displayable(running_stage.plan.as_ref()).tree_render().to_string(),
+                            PlanFormat::Tree => displayable(running_stage.plan.as_ref()).tree_render().to_string(),
                             PlanFormat::Metrics => format_stage_metrics(running_stage.plan.as_ref(), metrics),
                         });
                         summary.input_rows = running_stage
@@ -591,7 +622,7 @@ pub async fn get_query_stages<
                                         finish_time: info.finish_time as u64,
                                         input_rows,
                                         output_rows,
-                                        status: task_status
+                                        status: task_status,
                                     }
                                 })
                             })
@@ -600,7 +631,7 @@ pub async fn get_query_stages<
                     ExecutionStage::Successful(completed_stage) => {
                         summary.stage_plan = Some(match plan_format {
                             PlanFormat::Default => displayable(completed_stage.plan.as_ref()).indent(false).to_string(),
-                            PlanFormat::Tree    => displayable(completed_stage.plan.as_ref()).tree_render().to_string(),
+                            PlanFormat::Tree => displayable(completed_stage.plan.as_ref()).tree_render().to_string(),
                             PlanFormat::Metrics => format_stage_metrics(completed_stage.plan.as_ref(), &completed_stage.stage_metrics),
                         });
                         summary.input_rows = get_combined_count(
@@ -638,7 +669,7 @@ pub async fn get_query_stages<
                                     finish_time: task_info.finish_time as u64,
                                     input_rows,
                                     output_rows,
-                                    status: task_status
+                                    status: task_status,
                                 })
                             })
                             .collect();
@@ -908,7 +939,7 @@ pub async fn get_job_dot_graph<
         })?
     {
         ExecutionGraphDot::generate(graph.as_ref())
-            .map_err(|e|  {
+            .map_err(|e| {
                 tracing::error!("Error occurred while getting the dot graph for job '{job_id}' reason: {e:?}");
                 SchedulerErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR)
             })
@@ -953,10 +984,10 @@ pub async fn get_job_svg_graph<
                 &mut PrinterContext::default(),
                 vec![CommandArg::Format(Format::Svg)],
             )
-            .map_err(|e| {
-                tracing::error!("Error occurred while getting job svg graph for job '{job_id}' reason: {e:?}");
-                SchedulerErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR)
-            })?;
+                .map_err(|e| {
+                    tracing::error!("Error occurred while getting job svg graph for job '{job_id}' reason: {e:?}");
+                    SchedulerErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR)
+                })?;
 
             let svg = String::from_utf8_lossy(&result).to_string();
             Ok(Response::builder()
