@@ -16,7 +16,9 @@
 // under the License.
 use crate::physical_optimizer::filter_pushdown::FilterPushdown;
 use crate::state::aqe::adapter::BallistaAdapter;
-use crate::state::aqe::execution_plan::{AdaptiveDatafusionExec, ExchangeExec};
+use crate::state::aqe::execution_plan::{
+    AdaptiveDatafusionExec, ExchangeExec, RangeRepartitionRouting,
+};
 use crate::state::aqe::optimizer_rule::chaos_exec::ChaosCreatingRule;
 use crate::state::aqe::optimizer_rule::{
     CoalescePartitionsRule, DelayJoinSelectionRule, DistributedExchangeRule,
@@ -207,6 +209,30 @@ impl AdaptivePlanner {
     ///
     /// # Returns
     /// A `Result` indicating success or failure.
+    /// Attaches range-repartition-recovered range boundaries to the
+    /// boundary `ExchangeExec` for `stage_id`. Called right after the
+    /// completed range-repartition stage's partition mapping is resolved;
+    /// the routing carries the cuts + routing expression that downstream
+    /// task specialization needs to build per-partition range filters.
+    ///
+    /// No-op if the stage's boundary root is an `AdaptiveDatafusionExec`
+    /// (query root) — a range repartition writes at a shuffle boundary, so
+    /// the parking slot only exists on the `ExchangeExec` variant.
+    pub(super) fn set_range_repartition_routing(
+        &mut self,
+        stage_id: usize,
+        routing: RangeRepartitionRouting,
+    ) -> common::Result<()> {
+        if let Some(exchange) = self
+            .runnable_stage_cache
+            .get(&stage_id)
+            .and_then(|stage| stage.downcast_ref::<ExchangeExec>())
+        {
+            exchange.resolve_range_repartition_routing(routing);
+        }
+        Ok(())
+    }
+
     pub(super) fn finalise_stage_internal(
         &mut self,
         stage_id: usize,
@@ -261,9 +287,12 @@ impl AdaptivePlanner {
         }
     }
 
-    /// Once all tasks has been completed marks stage as resolved
-    /// and returns partition allocations
-    pub fn finalise_stage(
+    /// Once all tasks have completed, pop the accumulated stage output as a
+    /// K-shaped `Vec<Vec<PartitionLocation>>` (or the broadcast-shape variant)
+    /// *without* parking it on the ExchangeExec. Caller can post-process
+    /// (e.g. range-repartition overlap remap) before calling
+    /// [`resolve_stage_partitions`](Self::resolve_stage_partitions).
+    pub fn take_stage_output_partitions(
         &mut self,
         stage_id: usize,
     ) -> common::Result<Vec<Vec<PartitionLocation>>> {
@@ -293,8 +322,18 @@ impl AdaptivePlanner {
                 ))?
                 .partition_locations(output_partition_count)
         };
-        self.finalise_stage_internal(stage_id, stage_output.clone())?;
         Ok(stage_output)
+    }
+
+    /// Park the given partition list on the stage's ExchangeExec and trigger
+    /// a replan. Pairs with
+    /// [`take_stage_output_partitions`](Self::take_stage_output_partitions).
+    pub fn resolve_stage_partitions(
+        &mut self,
+        stage_id: usize,
+        partitions: Vec<Vec<PartitionLocation>>,
+    ) -> common::Result<()> {
+        self.finalise_stage_internal(stage_id, partitions)
     }
 
     /// Replans the stages by applying physical optimizations.

@@ -16,6 +16,9 @@
 // under the License.
 
 use crate::state::aqe::execution_plan::{AdaptiveDatafusionExec, ExchangeExec};
+use ballista_core::execution_plans::{
+    OrderedRangeRepartitionExec, RuntimeStatsExec, UnorderedRangeRepartitionExec,
+};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -90,9 +93,66 @@ impl DistributedExchangeRule {
                 );
                 return Ok(Transformed::yes(Arc::new(exchange_exec)));
             }
+        } else if execution_plan.downcast_ref::<ExchangeExec>().is_none() {
+            // Fourth classifier arm: any node whose immediate child is a
+            // range-repartition chain top (a `RuntimeStatsExec` whose input
+            // is `UnorderedRangeRepartitionExec` or
+            // `OrderedRangeRepartitionExec`) needs a passthrough
+            // `ExchangeExec(None)` inserted between them, so the range
+            // repartition and its `stats_report` end up on the upstream side
+            // of the stage boundary — that's the stage the executor's report
+            // walker runs on, so the sketches ship to the scheduler at
+            // stage-N completion.
+            //
+            // Idempotent: after insertion the child slot holds an
+            // `ExchangeExec`, which is not a range-repartition chain top;
+            // the guard on this arm
+            // (`execution_plan.downcast_ref::<ExchangeExec>().is_none()`)
+            // stops us from wrapping again on subsequent AQE replans, since
+            // the visited node would be the wrapping `ExchangeExec` itself.
+            let children = execution_plan.children();
+            if children.iter().any(|c| is_range_repartition_chain_top(c)) {
+                let new_children: Vec<Arc<dyn ExecutionPlan>> = children
+                    .into_iter()
+                    .map(|c| {
+                        if is_range_repartition_chain_top(c) {
+                            let id = self
+                                .plan_id_generator
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            Arc::new(ExchangeExec::new((*c).clone(), None, id))
+                                as Arc<dyn ExecutionPlan>
+                        } else {
+                            (*c).clone()
+                        }
+                    })
+                    .collect();
+                return Ok(Transformed::yes(
+                    execution_plan.with_new_children(new_children)?,
+                ));
+            }
         }
         Ok(Transformed::no(execution_plan))
     }
+}
+
+/// True iff `plan` is a `RuntimeStatsExec` sitting directly above an
+/// `UnorderedRangeRepartitionExec` or `OrderedRangeRepartitionExec` — the
+/// canonical "stats_report" shape a range-repartition-inserting rule emits
+/// at the top of its splice.
+fn is_range_repartition_chain_top(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if plan.downcast_ref::<RuntimeStatsExec>().is_none() {
+        return false;
+    }
+    let children = plan.children();
+    let [child] = children.as_slice() else {
+        return false;
+    };
+    child
+        .downcast_ref::<UnorderedRangeRepartitionExec>()
+        .is_some()
+        || child
+            .downcast_ref::<OrderedRangeRepartitionExec>()
+            .is_some()
 }
 
 impl PhysicalOptimizerRule for DistributedExchangeRule {

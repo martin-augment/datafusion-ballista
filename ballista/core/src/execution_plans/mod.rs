@@ -41,11 +41,13 @@ use datafusion::common::exec_err;
 pub use distributed_explain_analyze::DistributedExplainAnalyzeExec;
 pub use distributed_query::{DistributedQueryExec, execute_physical_plan};
 pub use ordered_range_repartition::OrderedRangeRepartitionExec;
-pub use per_partition_filter::PerPartitionFilterExec;
+pub use per_partition_filter::{PerPartitionFilterExec, range_partition_predicates};
 pub use runtime_stats::{
     MergedRuntimeStats, RuntimeStatsExec, TaskRuntimeStats,
-    collect_reports as collect_runtime_stats_reports, log_merged_runtime_stats,
-    merge_reports as merge_runtime_stats_reports, sketch_from_proto, sketch_to_proto,
+    collect_reports as collect_runtime_stats_reports, compute_overlapping_locations,
+    find_range_repartition_routing_expr, log_merged_runtime_stats,
+    merge_reports as merge_runtime_stats_reports, overlap_remap_partitions,
+    plan_contains_range_repartition, sketch_from_proto, sketch_to_proto,
 };
 pub use shuffle_reader::{CoalescePlan, PartitionGroup, ShuffleReaderExec};
 pub use shuffle_reader::{stats_for_partition, stats_for_partitions};

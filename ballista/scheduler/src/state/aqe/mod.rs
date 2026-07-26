@@ -18,6 +18,7 @@
 use crate::display::print_stage_metrics;
 use crate::scheduler_server::event::QueryStageSchedulerEvent;
 use crate::scheduler_server::timestamp_millis;
+use crate::state::aqe::execution_plan::RangeRepartitionRouting;
 use crate::state::aqe::planner::AdaptivePlanner;
 use crate::state::execution_graph::{
     ExecutionGraph, ExecutionGraphBox, ExecutionStage, ResolvedStage, RunningTaskInfo,
@@ -283,6 +284,104 @@ impl AdaptiveExecutionGraph {
         Ok(events)
     }
 
+    /// If the completed stage's plan contains a range repartition (URRE or
+    /// ORRE), remap the default `partition_id`-passthrough location list to
+    /// the overlap-based mapping computed from merged sketches, and return
+    /// the recovered `RangeRepartitionRouting` (cuts + routing expression)
+    /// so the caller can park it on the stage's downstream exchange for use
+    /// at task-specialization time.
+    ///
+    /// Returns `(default, None)` when no range repartition is present or
+    /// when there are no non-empty sketches to merge — the ordinary
+    /// passthrough behavior.
+    fn maybe_range_repartition_overlap_remap(
+        &self,
+        stage_id: usize,
+        default: Vec<Vec<PartitionLocation>>,
+    ) -> ballista_core::error::Result<(
+        Vec<Vec<PartitionLocation>>,
+        Option<RangeRepartitionRouting>,
+    )> {
+        let Some(ExecutionStage::Running(running_stage)) = self.stages.get(&stage_id)
+        else {
+            return Ok((default, None));
+        };
+        if !ballista_core::execution_plans::plan_contains_range_repartition(
+            running_stage.plan.as_ref(),
+        ) {
+            return Ok((default, None));
+        }
+        if running_stage.runtime_stats_reports.is_empty() {
+            info!(
+                "range-repartition stage {} completed with no runtime-stats \
+                 reports; falling back to passthrough partition mapping",
+                stage_id,
+            );
+            return Ok((default, None));
+        }
+        // Merge sketches to get global cuts, then remap.
+        let raw: Vec<_> = running_stage
+            .runtime_stats_reports
+            .iter()
+            .map(|t| t.report.clone())
+            .collect();
+        let merged = ballista_core::execution_plans::merge_runtime_stats_reports(&raw)
+            .map_err(|e| {
+                BallistaError::General(format!(
+                    "range-repartition overlap remap: merge_reports failed for \
+                     stage {stage_id}: {e}"
+                ))
+            })?;
+        // A range-repartition stage produces one report group (its single
+        // routing expression). Pick the first non-empty cuts and remap; if
+        // there are no cuts (all sketches empty), pass the default through.
+        let Some(cuts) = merged.iter().map(|m| &m.cuts).find(|c| !c.is_empty()) else {
+            info!(
+                "range-repartition stage {} produced no non-empty sketches; \
+                 falling back to passthrough partition mapping",
+                stage_id,
+            );
+            return Ok((default, None));
+        };
+        let cuts = cuts.clone();
+        let remapped = ballista_core::execution_plans::overlap_remap_partitions(
+            default,
+            &running_stage.runtime_stats_reports,
+            &cuts,
+        )
+        .map_err(|e| {
+            BallistaError::General(format!(
+                "range-repartition overlap remap failed for stage {stage_id}: {e}"
+            ))
+        })?;
+        info!(
+            "range-repartition stage {} partition mapping remapped by \
+             sketch-overlap: {} downstream partitions, total {} producer files",
+            stage_id,
+            remapped.len(),
+            remapped.iter().map(|v| v.len()).sum::<usize>(),
+        );
+        // The routing expression on the range repartition is the same one
+        // downstream filters need to reference. Missing it here is a
+        // plan-shape bug (range repartition detected by
+        // `plan_contains_range_repartition` but the walker can't find it) —
+        // surface as the ordinary passthrough case so the query still
+        // completes, at the cost of straddling correctness.
+        let routing =
+            ballista_core::execution_plans::find_range_repartition_routing_expr(
+                running_stage.plan.as_ref(),
+            )
+            .map(|routing_expr| RangeRepartitionRouting { cuts, routing_expr });
+        if routing.is_none() {
+            info!(
+                "range-repartition stage {} passed \
+                 plan_contains_range_repartition but no routing expression was \
+                 located; downstream filters will not be injected",
+                stage_id,
+            );
+        }
+        Ok((remapped, routing))
+    }
     /// Return a Vec of stages to cancel
     fn update_stage_progress(
         &mut self,
@@ -294,7 +393,25 @@ impl AdaptiveExecutionGraph {
             .update_exchange_locations(stage_id, locations)?;
 
         if is_completed {
-            let locations = self.planner.finalise_stage(stage_id)?;
+            // Range-repartition-terminated stages need overlap-based remap of
+            // the per-downstream-partition location list. For every other
+            // stage, pass the accumulated stage output through unchanged (the
+            // default `partition_id`-passthrough mapping).
+            let default = self.planner.take_stage_output_partitions(stage_id)?;
+            let (locations, range_repartition_routing) =
+                self.maybe_range_repartition_overlap_remap(stage_id, default)?;
+            // Park recovered range boundaries on the stage's boundary
+            // ExchangeExec BEFORE `resolve_stage_partitions` runs, because
+            // that call removes the stage from `runnable_stage_cache` —
+            // after which the exchange is no longer reachable by stage_id.
+            // Downstream stage-N+1 task specialization needs the routing to
+            // wrap the ShuffleReaderExec in a `PerPartitionFilterExec`.
+            if let Some(routing) = range_repartition_routing {
+                self.planner
+                    .set_range_repartition_routing(stage_id, routing)?;
+            }
+            self.planner
+                .resolve_stage_partitions(stage_id, locations.clone())?;
 
             let (runnable, stages_to_cancel) = self.planner.actionable_stages()?;
 

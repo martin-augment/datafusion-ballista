@@ -791,8 +791,9 @@ fn merge_group(
 /// `producer_task_id` that emitted it. The scheduler stores these on
 /// `RunningStage.runtime_stats_reports` so downstream stages can address
 /// individual producer files as `(producer_task_id, partition_id)` pairs —
-/// the partition_id inside a report is producer-local (0..K URRE sub-parts),
-/// so the pair is what uniquely identifies a shuffle file across producers.
+/// the partition_id inside a report is producer-local (0..K range-repartition
+/// sub-parts), so the pair is what uniquely identifies a shuffle file across
+/// producers.
 #[derive(Debug, Clone)]
 pub struct TaskRuntimeStats {
     /// Producer task's task_id at the time it emitted the report. Matches
@@ -801,6 +802,218 @@ pub struct TaskRuntimeStats {
     /// The report itself: per-partition row counts and (in sketch mode)
     /// quantile sketches for the routing expression.
     pub report: crate::serde::protobuf::RuntimeStatsReport,
+}
+
+/// One producer file's coordinates: the pair that uniquely identifies a
+/// range-repartition-stage output file across all producers.
+/// `producer_task_id` matches the `file_id` field on emitted
+/// `ShuffleWritePartition` records; `sub_part_id` matches the `partition_id`
+/// inside each producer's `RuntimeStatsReport`. The pair together names a
+/// specific file on disk (`work_dir/job/stage/sub_part/task_id.data` in the
+/// passthrough writer's path convention).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubPartLocation {
+    pub producer_task_id: usize,
+    pub sub_part_id: u32,
+}
+
+/// True iff `plan`'s subtree contains an `UnorderedRangeRepartitionExec` or
+/// `OrderedRangeRepartitionExec` — a signal that the stage's output files
+/// are range-K-space-routed, so downstream consumers need overlap-based
+/// routing rather than the passthrough-by-partition-id default.
+///
+/// Walks the tree top-down. Doesn't descend into leaves — the range
+/// repartition would sit above any DataSourceExec at the bottom of a
+/// Ballista stage.
+pub fn plan_contains_range_repartition(plan: &dyn ExecutionPlan) -> bool {
+    if plan
+        .downcast_ref::<super::UnorderedRangeRepartitionExec>()
+        .is_some()
+        || plan
+            .downcast_ref::<super::OrderedRangeRepartitionExec>()
+            .is_some()
+    {
+        return true;
+    }
+    plan.children()
+        .iter()
+        .any(|c| plan_contains_range_repartition(c.as_ref()))
+}
+
+/// Walk `plan` for the first `UnorderedRangeRepartitionExec` or
+/// `OrderedRangeRepartitionExec` and return its routing expression
+/// (`order_by[0].expr`). Consumers that need the routing expression to
+/// build downstream range filters use this instead of
+/// [`plan_contains_range_repartition`], which is a boolean-only sibling.
+pub fn find_range_repartition_routing_expr(
+    plan: &dyn ExecutionPlan,
+) -> Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>> {
+    if let Some(rre) = plan.downcast_ref::<super::UnorderedRangeRepartitionExec>() {
+        return Some(rre.order_by()[0].expr.clone());
+    }
+    if let Some(rre) = plan.downcast_ref::<super::OrderedRangeRepartitionExec>() {
+        return Some(rre.order_by()[0].expr.clone());
+    }
+    for c in plan.children() {
+        if let Some(expr) = find_range_repartition_routing_expr(c.as_ref()) {
+            return Some(expr);
+        }
+    }
+    None
+}
+
+/// Rebuild a stage's `Vec<Vec<PartitionLocation>>` under range-repartition
+/// overlap semantics. Consumes `default` (the passthrough-by-`partition_id`
+/// mapping) so its per-file metadata (executor, stats, file_id,
+/// is_sort_shuffle) can be pulled onto the remapped output.
+///
+/// # Returns
+///
+/// A new `Vec<Vec<PartitionLocation>>` where the outer index is the
+/// downstream stage-N+1 input partition k, and the inner list is the
+/// specific stage-N producer files whose sketched range overlaps k's
+/// assigned global range. Content-wise identical to what
+/// [`compute_overlapping_locations`] returns, but each `SubPartLocation`
+/// is expanded into a full `PartitionLocation` (executor, stats, etc.
+/// carried over from `default`).
+///
+/// # Errors
+///
+/// - Sketch decode failure inside `compute_overlapping_locations`.
+/// - `default` missing an entry the overlap step asks for
+///   (`(producer_task_id, sub_part_id)` combination not found), which
+///   would indicate a bookkeeping inconsistency between stage-output
+///   accumulation and sketch reporting.
+pub fn overlap_remap_partitions(
+    default: Vec<Vec<crate::serde::scheduler::PartitionLocation>>,
+    reports: &[TaskRuntimeStats],
+    global_cuts: &[f64],
+) -> Result<Vec<Vec<crate::serde::scheduler::PartitionLocation>>> {
+    use std::collections::HashMap;
+    let assignments = compute_overlapping_locations(reports, global_cuts)?;
+
+    // Index the default's flat entries by `(producer_task_id, sub_part_id)`.
+    // Producer task_id lives on `PartitionLocation.file_id`; sub_part_id
+    // lives on `PartitionLocation.partition_id.partition_id`.
+    let mut lookup: HashMap<(usize, u32), crate::serde::scheduler::PartitionLocation> =
+        HashMap::new();
+    for bucket in &default {
+        for loc in bucket {
+            let Some(file_id) = loc.file_id else {
+                return internal_err!(
+                    "range-repartition overlap remap: PartitionLocation missing \
+                     file_id (range-repartition stages emit passthrough files \
+                     with file_id=task_id) — partition_id={}",
+                    loc.partition_id.partition_id
+                );
+            };
+            let sub_part_id = loc.partition_id.partition_id as u32;
+            lookup.insert((file_id as usize, sub_part_id), loc.clone());
+        }
+    }
+
+    let mut remapped = Vec::with_capacity(assignments.len());
+    for bucket in assignments {
+        let mut inner = Vec::with_capacity(bucket.len());
+        for spl in bucket {
+            let Some(loc) = lookup.get(&(spl.producer_task_id, spl.sub_part_id)) else {
+                let key = format!(
+                    "(producer_task_id={}, sub_part_id={})",
+                    spl.producer_task_id, spl.sub_part_id
+                );
+                return internal_err!(
+                    "range-repartition overlap remap: no default PartitionLocation \
+                     for {} — stage-output vs. runtime-stats-report inconsistency",
+                    key
+                );
+            };
+            inner.push(loc.clone());
+        }
+        remapped.push(inner);
+    }
+    Ok(remapped)
+}
+
+/// Compute, for each stage-N+1 input partition, which stage-N producer
+/// files it needs to fetch — based on sketch-range overlap with the
+/// globally-assigned cut range.
+///
+/// # Arguments
+///
+/// - `reports` — per-task sketches from every stage-N producer task,
+///   keyed by producer `task_id` and (within each report) by
+///   range-repartition sub-part `partition_id`.
+/// - `global_cuts` — `K - 1` scheduler-computed cut points that divide
+///   the value range into K globally-consistent bins, where K = the
+///   stage-N+1 partition count.
+///
+/// # Returns
+///
+/// `Vec<Vec<SubPartLocation>>` where:
+/// - **Outer index** `k` = downstream stage-N+1 input partition, in
+///   `0..K` (`K = global_cuts.len() + 1`).
+/// - **Inner Vec** = the stage-N producer files (each identified by
+///   `SubPartLocation { producer_task_id, sub_part_id }`) whose sketched
+///   value range overlaps k's assigned global half-open range. Every
+///   file listed here is a source the downstream task-k reader must
+///   fetch; the injected `FilterExec` on the downstream side drops rows
+///   from over-inclusive sub-parts that fell outside k's range.
+///
+/// Downstream partition ranges follow the design-doc's half-open
+/// convention:
+/// - `k = 0`         → `(-∞, cuts[0])`
+/// - `0 < k < K - 1` → `[cuts[k-1], cuts[k])`
+/// - `k = K - 1`     → `[cuts[K-2], +∞)`
+///
+/// A sketch's range is `[sketch.min(), sketch.max()]` (both inclusive).
+/// `[min, max]` overlaps `[lower, upper)` iff `max >= lower AND min < upper`.
+///
+/// Reports whose sketch is `None` (row-count-only mode) or whose sketch
+/// has zero samples contribute no locations — nothing to route.
+///
+/// # Errors
+///
+/// Sketch decode errors abort the whole computation; the caller sees the
+/// error rather than silent misrouting. Wire corruption in a sketch
+/// means the stage's routing decisions are suspect.
+pub fn compute_overlapping_locations(
+    reports: &[TaskRuntimeStats],
+    global_cuts: &[f64],
+) -> Result<Vec<Vec<SubPartLocation>>> {
+    let k = global_cuts.len() + 1;
+    let mut out: Vec<Vec<SubPartLocation>> = vec![Vec::new(); k];
+    for stats in reports {
+        for entry in &stats.report.partitions {
+            let Some(sketch_proto) = entry.sketch.as_ref() else {
+                continue;
+            };
+            let sketch = sketch_from_proto(sketch_proto)?;
+            if sketch.count() == 0.0 {
+                continue;
+            }
+            let smin = sketch.min();
+            let smax = sketch.max();
+            for (partition_k, bucket) in out.iter_mut().enumerate() {
+                let lower = if partition_k == 0 {
+                    f64::NEG_INFINITY
+                } else {
+                    global_cuts[partition_k - 1]
+                };
+                let upper = if partition_k == k - 1 {
+                    f64::INFINITY
+                } else {
+                    global_cuts[partition_k]
+                };
+                if smax >= lower && smin < upper {
+                    bucket.push(SubPartLocation {
+                        producer_task_id: stats.producer_task_id,
+                        sub_part_id: entry.partition_id,
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Merge `reports` and log each group's merged view at `debug!`
@@ -1391,5 +1604,315 @@ mod merge_tests {
     #[test]
     fn merge_reports_empty_input_is_empty_output() {
         assert!(merge_reports(&[]).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod plan_walker_tests {
+    //! `plan_contains_range_repartition` and
+    //! `find_range_repartition_routing_expr` — recursive walks that recognize
+    //! both `UnorderedRangeRepartitionExec` and `OrderedRangeRepartitionExec`
+    //! at any depth.
+
+    use super::*;
+    use crate::execution_plans::{
+        OrderedRangeRepartitionExec, UnorderedRangeRepartitionExec,
+    };
+    use datafusion::arrow::compute::SortOptions;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion::physical_plan::expressions::col;
+    use datafusion::physical_plan::sorts::sort::SortExec;
+
+    fn v_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, false)]))
+    }
+
+    fn v_source() -> Arc<dyn ExecutionPlan> {
+        let schema = v_schema();
+        let memory =
+            Arc::new(MemorySourceConfig::try_new(&[vec![]], schema, None).unwrap());
+        Arc::new(DataSourceExec::new(memory))
+    }
+
+    fn sort_expr_v() -> PhysicalSortExpr {
+        let schema = v_schema();
+        PhysicalSortExpr {
+            expr: col("v", schema.as_ref()).unwrap(),
+            options: SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        }
+    }
+
+    fn urre_over_source(k: usize) -> Arc<dyn ExecutionPlan> {
+        Arc::new(
+            UnorderedRangeRepartitionExec::try_new(v_source(), vec![sort_expr_v()], k)
+                .unwrap(),
+        )
+    }
+
+    fn orre_over_source(k: usize) -> Arc<dyn ExecutionPlan> {
+        // ORRE demands sorted input.
+        let sort = Arc::new(SortExec::new(
+            LexOrdering::new(vec![sort_expr_v()]).unwrap(),
+            v_source(),
+        ));
+        Arc::new(
+            OrderedRangeRepartitionExec::try_new(sort, vec![sort_expr_v()], k).unwrap(),
+        )
+    }
+
+    #[test]
+    fn plan_contains_range_repartition_bare_source_returns_false() {
+        assert!(!plan_contains_range_repartition(v_source().as_ref()));
+    }
+
+    #[test]
+    fn plan_contains_range_repartition_urre_at_root_returns_true() {
+        assert!(plan_contains_range_repartition(
+            urre_over_source(4).as_ref()
+        ));
+    }
+
+    #[test]
+    fn plan_contains_range_repartition_orre_at_root_returns_true() {
+        assert!(plan_contains_range_repartition(
+            orre_over_source(4).as_ref()
+        ));
+    }
+
+    #[test]
+    fn plan_contains_range_repartition_urre_nested_returns_true() {
+        // Canonical shape: RuntimeStatsExec above URRE, plus one more
+        // stats-wrapper layer to make sure the walk descends more than
+        // once.
+        let urre = urre_over_source(4);
+        let inner_stats =
+            Arc::new(RuntimeStatsExec::try_new(urre, Some(vec![sort_expr_v()])).unwrap());
+        let outer: Arc<dyn ExecutionPlan> = Arc::new(
+            RuntimeStatsExec::try_new(inner_stats, Some(vec![sort_expr_v()])).unwrap(),
+        );
+        assert!(plan_contains_range_repartition(outer.as_ref()));
+    }
+
+    #[test]
+    fn plan_contains_range_repartition_orre_nested_returns_true() {
+        let orre = orre_over_source(4);
+        let inner_stats =
+            Arc::new(RuntimeStatsExec::try_new(orre, Some(vec![sort_expr_v()])).unwrap());
+        let outer: Arc<dyn ExecutionPlan> = Arc::new(
+            RuntimeStatsExec::try_new(inner_stats, Some(vec![sort_expr_v()])).unwrap(),
+        );
+        assert!(plan_contains_range_repartition(outer.as_ref()));
+    }
+
+    #[test]
+    fn find_range_repartition_routing_expr_bare_source_returns_none() {
+        assert!(find_range_repartition_routing_expr(v_source().as_ref()).is_none());
+    }
+
+    #[test]
+    fn find_range_repartition_routing_expr_urre_returns_first_order_by_expr() {
+        let urre = urre_over_source(4);
+        let expr = find_range_repartition_routing_expr(urre.as_ref())
+            .expect("URRE must expose its routing expression");
+        // The expression is the `v` column — verify by string equality since
+        // PhysicalExpr doesn't implement PartialEq.
+        assert_eq!(format!("{expr}"), format!("{}", sort_expr_v().expr));
+    }
+
+    #[test]
+    fn find_range_repartition_routing_expr_orre_returns_first_order_by_expr() {
+        let orre = orre_over_source(4);
+        let expr = find_range_repartition_routing_expr(orre.as_ref())
+            .expect("ORRE must expose its routing expression");
+        assert_eq!(format!("{expr}"), format!("{}", sort_expr_v().expr));
+    }
+
+    #[test]
+    fn find_range_repartition_routing_expr_descends_through_stats_wrapper() {
+        // Canonical shape: RuntimeStatsExec above URRE — the walker must
+        // recurse through the stats wrapper to find the URRE beneath.
+        let urre = urre_over_source(4);
+        let stats: Arc<dyn ExecutionPlan> =
+            Arc::new(RuntimeStatsExec::try_new(urre, Some(vec![sort_expr_v()])).unwrap());
+        let expr = find_range_repartition_routing_expr(stats.as_ref())
+            .expect("walker must descend past RuntimeStatsExec");
+        assert_eq!(format!("{expr}"), format!("{}", sort_expr_v().expr));
+    }
+}
+
+#[cfg(test)]
+mod overlap_remap_tests {
+    //! `overlap_remap_partitions` — takes a passthrough
+    //! `Vec<Vec<PartitionLocation>>` and rewrites it under overlap semantics
+    //! computed from merged sketches. Straddling sub-parts appear in every
+    //! downstream partition whose range they touch; bookkeeping mismatches
+    //! surface as errors rather than silent misroutes.
+
+    use super::*;
+    use crate::serde::protobuf::{RuntimeStatsPartitionEntry, RuntimeStatsReport};
+    use crate::serde::scheduler::{
+        ExecutorMetadata, ExecutorOperatingSystemSpecification, ExecutorSpecification,
+        PartitionId, PartitionLocation, PartitionStats,
+    };
+
+    /// Build a `PartitionLocation` for a producer file identified by
+    /// `(producer_task_id, sub_part_id)`. `file_id = producer_task_id`
+    /// matches the passthrough writer's convention.
+    fn location(sub_part_id: usize, producer_task_id: usize) -> PartitionLocation {
+        PartitionLocation {
+            map_partition_id: 0,
+            partition_id: PartitionId {
+                job_id: "test-job".into(),
+                stage_id: 0,
+                partition_id: sub_part_id,
+            },
+            executor_meta: ExecutorMetadata {
+                id: format!("exec-{producer_task_id}"),
+                host: "".to_string(),
+                port: 0,
+                grpc_port: 0,
+                specification: ExecutorSpecification::default().with_vcores(0),
+                os_info: ExecutorOperatingSystemSpecification::default(),
+            },
+            partition_stats: PartitionStats::default(),
+            file_id: Some(producer_task_id as u64),
+            is_sort_shuffle: false,
+        }
+    }
+
+    /// Build a report whose sub-parts each carry a T-Digest sketch over
+    /// `values`. Slot `sub_part_id` gets a sketch of `values[sub_part_id]`.
+    fn sketch_report(
+        producer_task_id: usize,
+        values_per_sub_part: Vec<Vec<f64>>,
+    ) -> TaskRuntimeStats {
+        let partitions = values_per_sub_part
+            .into_iter()
+            .enumerate()
+            .map(|(sub_part_id, samples)| {
+                let sketch = if samples.is_empty() {
+                    None
+                } else {
+                    let digest = TDigest::new(100).merge_unsorted_f64(samples.clone());
+                    Some(sketch_to_proto(&digest).unwrap())
+                };
+                RuntimeStatsPartitionEntry {
+                    partition_id: sub_part_id as u32,
+                    row_count: samples.len() as u64,
+                    sketch,
+                }
+            })
+            .collect();
+        TaskRuntimeStats {
+            producer_task_id,
+            report: RuntimeStatsReport {
+                order_by: vec![],
+                partitions,
+            },
+        }
+    }
+
+    /// Two producers with disjoint value ranges + one downstream cut →
+    /// each downstream partition gets exactly one producer's files.
+    #[test]
+    fn overlap_remap_disjoint_producers_route_to_single_partition() {
+        // Producer 100 covers [0, 10); producer 200 covers [20, 30).
+        let reports = vec![
+            sketch_report(100, vec![vec![0.0, 5.0, 9.0]]),
+            sketch_report(200, vec![vec![20.0, 25.0, 29.0]]),
+        ];
+        // Cut at 15 → partition 0 = (-∞, 15), partition 1 = [15, +∞).
+        let cuts = vec![15.0];
+        // Default passthrough map: both producers wrote to sub_part_id=0.
+        let default = vec![vec![location(0, 100), location(0, 200)]];
+
+        let remapped = overlap_remap_partitions(default, &reports, &cuts).unwrap();
+        assert_eq!(remapped.len(), 2, "K = cuts.len() + 1");
+        // Partition 0: only producer 100.
+        assert_eq!(remapped[0].len(), 1);
+        assert_eq!(remapped[0][0].file_id, Some(100));
+        // Partition 1: only producer 200.
+        assert_eq!(remapped[1].len(), 1);
+        assert_eq!(remapped[1][0].file_id, Some(200));
+    }
+
+    /// A straddling sub-part — one whose sketched [min, max] spans the cut
+    /// — appears in BOTH downstream partitions' lists. This is the case
+    /// PerPartitionFilterExec exists to clean up.
+    #[test]
+    fn overlap_remap_straddling_producer_appears_in_both_partitions() {
+        // Producer 300 covers [5, 25) — straddles the cut at 15.
+        let reports = vec![sketch_report(300, vec![vec![5.0, 15.0, 25.0]])];
+        let cuts = vec![15.0];
+        let default = vec![vec![location(0, 300)]];
+
+        let remapped = overlap_remap_partitions(default, &reports, &cuts).unwrap();
+        assert_eq!(remapped.len(), 2);
+        assert_eq!(remapped[0].len(), 1, "straddler in partition 0");
+        assert_eq!(remapped[0][0].file_id, Some(300));
+        assert_eq!(remapped[1].len(), 1, "straddler in partition 1");
+        assert_eq!(remapped[1][0].file_id, Some(300));
+    }
+
+    /// A producer file without `file_id` means the writer that produced it
+    /// wasn't the passthrough writer — remap can't identify the file, so
+    /// error rather than silently misroute.
+    #[test]
+    fn overlap_remap_missing_file_id_errors() {
+        let reports = vec![sketch_report(100, vec![vec![1.0, 2.0, 3.0]])];
+        let cuts = vec![10.0];
+        // Loc has file_id=None — invalid for URRE/ORRE stages.
+        let mut bad = location(0, 100);
+        bad.file_id = None;
+        let default = vec![vec![bad]];
+
+        let err = overlap_remap_partitions(default, &reports, &cuts)
+            .expect_err("missing file_id must surface as an error");
+        assert!(
+            err.to_string().contains("missing file_id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The overlap step names a (producer_task_id, sub_part_id) pair that
+    /// isn't in the default passthrough map — bookkeeping mismatch between
+    /// stage-output accumulation and sketch reporting.
+    #[test]
+    fn overlap_remap_missing_default_location_errors() {
+        // Report from producer 100 sub_part_id=0.
+        let reports = vec![sketch_report(100, vec![vec![1.0, 2.0, 3.0]])];
+        let cuts = vec![10.0];
+        // But default only has producer 200 — no match.
+        let default = vec![vec![location(0, 200)]];
+
+        let err = overlap_remap_partitions(default, &reports, &cuts)
+            .expect_err("missing default location must surface as an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no default PartitionLocation")
+                && msg.contains("producer_task_id=100"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// Empty-sketch entries contribute no locations — every downstream
+    /// partition ends up empty. Not an error; the caller sees this as
+    /// "no data flowed through this producer."
+    #[test]
+    fn overlap_remap_empty_sketches_produce_empty_partitions() {
+        let reports = vec![sketch_report(100, vec![vec![]])];
+        let cuts = vec![10.0];
+        let default = vec![vec![location(0, 100)]];
+
+        let remapped = overlap_remap_partitions(default, &reports, &cuts).unwrap();
+        assert_eq!(remapped.len(), 2);
+        assert!(remapped[0].is_empty());
+        assert!(remapped[1].is_empty());
     }
 }
