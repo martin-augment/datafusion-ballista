@@ -26,12 +26,17 @@ edition = "2024"
 rust-version = "1.88.0"
 
 [workspace.dependencies]
-arrow = { version = "58.3", features = ["ipc_compression"] }
-arrow-flight = { version = "58.3", features = ["flight-sql-experimental"] }
+arrow = { version = "58.4", features = ["ipc_compression"] }
+arrow-flight = { version = "58.4", features = ["flight-sql-experimental"] }
 clap = { version = "4.5", features = ["derive", "cargo"] }
 
+# Keep these as minor-version requirements rather than exact patch pins. The
+# python workspace shares these crates through path dependencies, and
+# datafusion-python lags behind datafusion patch releases, so pinning a patch
+# here can break the wheel build. Cargo.lock records the exact patch version.
 datafusion = "54"
 datafusion-cli = "54"
+datafusion-functions-aggregate-common = "54"
 datafusion-proto = "54"
 datafusion-proto-common = "54"
 datafusion-spark = "54"
