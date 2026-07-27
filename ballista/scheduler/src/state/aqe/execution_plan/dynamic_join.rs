@@ -248,10 +248,13 @@ impl DynamicJoinSelectionExec {
         // actually builds from rather than `self.left` unconditionally.
         // `supports_swap_join_order` is true when the *left* is the larger side,
         // so a swap moves the build onto `self.right`.
-        let swap_inputs = SelectJoinRule::supports_swap_join_order(
-            self.left.as_ref(),
-            self.right.as_ref(),
-        )?;
+        // Null-aware anti joins are only valid as LeftAnti and therefore cannot
+        // participate in the size-driven input swap.
+        let swap_inputs = !self.null_aware
+            && SelectJoinRule::supports_swap_join_order(
+                self.left.as_ref(),
+                self.right.as_ref(),
+            )?;
         let build_side = if swap_inputs { &self.right } else { &self.left };
 
         let build_max_partition_bytes = max_per_partition_build_bytes(build_side);
@@ -284,12 +287,16 @@ impl DynamicJoinSelectionExec {
             self.join_type
         };
 
-        let partition_mode =
-            if under_threshold && collect_left_broadcast_safe(build_side_join_type) {
-                PartitionMode::CollectLeft
-            } else {
-                PartitionMode::Partitioned
-            };
+        // Unlike ordinary LeftAnti joins, null-aware anti joins require
+        // CollectLeft so each probe partition observes the build side's global
+        // NULL state. This semantic requirement overrides broadcast thresholds.
+        let partition_mode = if self.null_aware
+            || (under_threshold && collect_left_broadcast_safe(build_side_join_type))
+        {
+            PartitionMode::CollectLeft
+        } else {
+            PartitionMode::Partitioned
+        };
 
         let stats_left = self.left.partition_statistics(None)?;
         let stats_right = self.right.partition_statistics(None)?;

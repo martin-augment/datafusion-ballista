@@ -303,6 +303,14 @@ impl DefaultDistributedPlanner {
         if let Some(hash_join) = plan.downcast_ref::<HashJoinExec>()
             && *hash_join.partition_mode() == PartitionMode::CollectLeft
         {
+            // Null-aware anti joins must stay `CollectLeft`: they track
+            // probe-side state that a partitioned join cannot reconstruct, so
+            // never demote them regardless of join type or threshold. This
+            // exception must precede the generic broadcast-safety check because
+            // a normal LeftAnti join is not broadcast-safe.
+            if hash_join.null_aware {
+                return Ok(plan);
+            }
             // Broadcasting is only correct for probe-driven join types. If the
             // join type is not broadcast-safe, demote it back to a partitioned
             // (shuffle) join. Correctness guard, independent of the threshold.
@@ -312,12 +320,6 @@ impl DefaultDistributedPlanner {
                     hash_join.join_type(),
                 );
                 return Self::demote_collect_left_to_partitioned(hash_join, config);
-            }
-            // Null-aware anti joins must stay `CollectLeft`: they track
-            // probe-side state that a partitioned join cannot reconstruct, so
-            // never demote them regardless of the threshold.
-            if hash_join.null_aware {
-                return Ok(plan);
             }
             // Safe join type: honor the Ballista broadcast threshold. DataFusion
             // decided `CollectLeft` using its own session threshold, which can
@@ -1085,6 +1087,56 @@ order by
         assert!(stages[4].shuffle_output_partitioning().is_none());
 
         Ok(())
+    }
+
+    #[test]
+    fn null_aware_collect_left_join_is_never_demoted() {
+        use datafusion::{
+            arrow::datatypes::{DataType, Field, Schema},
+            common::{JoinType, NullEquality, Statistics},
+            physical_plan::{joins::PartitionMode, test::exec::StatisticsExec},
+        };
+
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, true)]));
+        let left = Arc::new(StatisticsExec::new(
+            Statistics::new_unknown(&schema),
+            schema.as_ref().clone(),
+        )) as Arc<dyn ExecutionPlan>;
+        let right = Arc::new(StatisticsExec::new(
+            Statistics::new_unknown(&schema),
+            schema.as_ref().clone(),
+        )) as Arc<dyn ExecutionPlan>;
+        let plan = Arc::new(
+            HashJoinExec::try_new(
+                left,
+                right,
+                vec![(
+                    Arc::new(Column::new("key", 0)) as _,
+                    Arc::new(Column::new("key", 0)) as _,
+                )],
+                None,
+                &JoinType::LeftAnti,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                true,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        let planned = DefaultDistributedPlanner::maybe_promote_to_broadcast(
+            plan,
+            &datafusion::config::ConfigOptions::new(),
+        )
+        .unwrap();
+        let hash_join = planned
+            .downcast_ref::<HashJoinExec>()
+            .expect("null-aware join should remain a HashJoinExec");
+
+        assert_eq!(*hash_join.join_type(), JoinType::LeftAnti);
+        assert_eq!(*hash_join.partition_mode(), PartitionMode::CollectLeft);
+        assert!(hash_join.null_aware);
     }
 
     #[tokio::test]
