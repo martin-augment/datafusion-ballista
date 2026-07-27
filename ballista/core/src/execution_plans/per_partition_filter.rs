@@ -284,10 +284,10 @@ impl RecordBatchStream for PerPartitionFilterStream {
 ///   K = 1        →  lit(true)   // empty cuts, single-bucket range repartition
 /// ```
 ///
-/// Consistent with [`crate::execution_plans::range_repartition_common`]'s
-/// `split_batch_by_range`, which uses the same half-open convention on the
-/// write side. Callers pass the range repartition's routing expression
-/// verbatim (`CAST(order_by[0] AS Float64)` today).
+/// Consistent with the private `range_repartition_common::split_batch_by_range`
+/// helper, which uses the same half-open convention on the write side.
+/// Callers pass the range repartition's routing expression verbatim
+/// (`CAST(order_by[0] AS Float64)` today).
 ///
 /// Non-null routing expressions only. Both `UnorderedRangeRepartitionExec`
 /// and `OrderedRangeRepartitionExec` refuse nullable routing exprs at
