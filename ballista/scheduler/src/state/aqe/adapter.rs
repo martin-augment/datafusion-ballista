@@ -19,7 +19,9 @@ use crate::planner::create_shuffle_writer_with_config;
 use crate::state::aqe::execution_plan::{AdaptiveDatafusionExec, ExchangeExec};
 use crate::state::aqe::planner::AdaptiveStageInfo;
 use ballista_core::JobId;
-use ballista_core::execution_plans::ShuffleReaderExec;
+use ballista_core::execution_plans::{
+    PerPartitionFilterExec, ShuffleReaderExec, range_partition_predicates,
+};
 use datafusion::common::exec_err;
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
@@ -28,6 +30,7 @@ use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     physical_plan::ExecutionPlan,
 };
+use log::info;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
@@ -105,7 +108,33 @@ impl BallistaAdapter {
                 )?,
             };
 
-            Ok(Transformed::yes(Arc::new(reader)))
+            let reader: Arc<dyn ExecutionPlan> = Arc::new(reader);
+            // If the upstream stage was range-repartition-routed and cuts
+            // were recovered at final-success, wrap the reader in a
+            // `PerPartitionFilterExec` so downstream partition k receives
+            // only rows whose routing value falls in the k-th cut range.
+            // Straddling sub-parts of the producer would otherwise feed
+            // multiple partitions and `FinalPartitioned` would split partial
+            // sums.
+            //
+            // Predicates are indexed on the global K-space here; the per-task
+            // specialization in `restrict_plan_to_partitions` slices them in
+            // lockstep with the reader's `partition` field so each task sees
+            // predicates and partitions matched positionally.
+            if let Some(routing) = exchange.range_repartition_routing() {
+                let predicates =
+                    range_partition_predicates(routing.routing_expr, &routing.cuts);
+                info!(
+                    "range-repartition: injecting PerPartitionFilterExec above \
+                     ShuffleReader for stage {} — {} predicates over {} cuts",
+                    stage_id,
+                    predicates.len(),
+                    routing.cuts.len(),
+                );
+                let filtered = PerPartitionFilterExec::try_new(reader, predicates)?;
+                return Ok(Transformed::yes(Arc::new(filtered)));
+            }
+            Ok(Transformed::yes(reader))
         } else {
             Ok(Transformed::no(plan))
         }
