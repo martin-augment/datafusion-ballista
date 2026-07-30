@@ -20,7 +20,8 @@ mod common;
 mod supported {
 
     use crate::common::{
-        remote_context, remote_context_with_state, standalone_context,
+        remote_context, remote_context_push_scheduling, remote_context_with_state,
+        remote_context_with_state_push_scheduling, standalone_context,
         standalone_context_with_state,
     };
     use ballista_core::config::BallistaConfig;
@@ -43,6 +44,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_execute_sql_collect(
         #[future(awt)]
@@ -82,6 +84,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_collect_client_statistics_for_show(
         #[future(awt)]
@@ -162,6 +165,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_collect_client_statistics_for_insert(
         #[future(awt)]
@@ -233,6 +237,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_execute_sql_show_configs(
         #[future(awt)]
@@ -264,6 +269,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_execute_sql_show_configs_ballista(
         #[future(awt)]
@@ -300,6 +306,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_execute_sql_set_configs(
         #[future(awt)]
@@ -335,6 +342,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_execute_show_tables(
         #[future(awt)]
@@ -375,6 +383,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_execute_sql_create_external_table(
         #[future(awt)]
@@ -407,6 +416,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_collect_from_dataframe(
         #[future(awt)]
@@ -442,6 +452,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_execute_sql_write(
         #[future(awt)]
@@ -494,6 +505,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_disable_view_types(
         #[future(awt)]
@@ -526,6 +538,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_set_collect_left_thresholds(
         #[future(awt)]
@@ -555,6 +568,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_execute_sql_show_with_url_table(
         #[future(awt)]
@@ -590,6 +604,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_support_sql_insert_into(
         #[future(awt)]
@@ -649,8 +664,10 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[case::standalone_state(standalone_context_with_state())]
     #[case::remote_state(remote_context_with_state())]
+    #[case::remote_state_push(remote_context_with_state_push_scheduling())]
     #[tokio::test]
     async fn should_execute_sql_write_read_roundtrip(
         #[future(awt)]
@@ -746,8 +763,10 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[case::standalone_state(standalone_context_with_state())]
     #[case::remote_state(remote_context_with_state())]
+    #[case::remote_state_push(remote_context_with_state_push_scheduling())]
     #[tokio::test]
     async fn should_execute_sql_show_multiple_times(
         #[future(awt)]
@@ -790,8 +809,10 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[case::standalone_state(standalone_context_with_state())]
     #[case::remote_state(remote_context_with_state())]
+    #[case::remote_state_push(remote_context_with_state_push_scheduling())]
     #[tokio::test]
     async fn should_execute_group_by(
         #[future(awt)]
@@ -829,6 +850,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_force_local_read(
         #[future(awt)]
@@ -887,6 +909,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_force_local_read_with_flight(
         #[future(awt)]
@@ -953,6 +976,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_support_sort_merge_join(
         #[future(awt)]
@@ -1008,6 +1032,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_support_hash_join_when_opted_in(
         #[future(awt)]
@@ -1066,6 +1091,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_execute_explain_query_correctly(
         #[future(awt)]
@@ -1123,6 +1149,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_execute_explain_analyze_query(
         #[future(awt)]
@@ -1207,6 +1234,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_force_client_pull(
         #[future(awt)]
@@ -1265,6 +1293,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
 
     async fn should_execute_sql_collect_from_arrow_file(
@@ -1303,6 +1332,7 @@ mod supported {
     #[rstest]
     #[case::standalone(standalone_context())]
     #[case::remote(remote_context())]
+    #[case::remote_push(remote_context_push_scheduling())]
     #[tokio::test]
     async fn should_set_io_retry_config(
         #[future(awt)]
