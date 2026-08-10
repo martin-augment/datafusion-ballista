@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::cluster::JobState;
+use crate::cluster::{JobState, JobStateEventStream};
 use crate::config::SchedulerConfig;
 use crate::planner::DefaultDistributedPlanner;
 use crate::scheduler_server::event::{QueryStageSchedulerEvent, SubmitPlan};
@@ -241,6 +241,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 matches!(job_info.status, Some(job_status::Status::Running(_)))
             })
             .count()
+    }
+
+    /// Returns a stream of job state events from the configured state backend.
+    pub async fn job_state_events(&self) -> Result<JobStateEventStream> {
+        self.state.job_state_events().await
     }
 
     /// Generate an ExecutionGraph for the job and save it to the persistent state.
@@ -1333,11 +1338,23 @@ mod tests {
         let manager_for_abort = manager.clone();
         let job_id_for_abort = job_id.clone();
         let abort = tokio::spawn(async move {
+            let manager_for_cancel = manager_for_abort.clone();
+            let job_id_for_cancel = job_id_for_abort.clone();
             manager_for_abort
                 .abort_job(
                     &job_id_for_abort,
                     "test failure".to_string(),
                     move |tasks| async move {
+                        let status = manager_for_cancel
+                            .get_job_status(&job_id_for_cancel)
+                            .await?
+                            .expect(
+                                "aborted job should remain visible during cancellation",
+                            );
+                        assert!(
+                            matches!(status.status, Some(Status::Failed(_))),
+                            "job must be terminal before executor tasks are cancelled"
+                        );
                         cancelled_tasks_for_abort.store(tasks.len(), Ordering::SeqCst);
                         Ok(())
                     },

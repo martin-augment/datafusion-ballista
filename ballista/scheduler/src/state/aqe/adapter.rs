@@ -18,8 +18,11 @@
 use crate::planner::create_shuffle_writer_with_config;
 use crate::state::aqe::execution_plan::{AdaptiveDatafusionExec, ExchangeExec};
 use crate::state::aqe::planner::AdaptiveStageInfo;
+use crate::state::execution_graph::StageOutput;
 use ballista_core::JobId;
-use ballista_core::execution_plans::ShuffleReaderExec;
+use ballista_core::execution_plans::{
+    PerPartitionFilterExec, ShuffleReaderExec, range_partition_predicates,
+};
 use datafusion::common::exec_err;
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
@@ -28,11 +31,13 @@ use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     physical_plan::ExecutionPlan,
 };
+use log::debug;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BallistaAdapter {
-    inputs: Vec<usize>,
+    inputs: HashMap<usize, StageOutput>,
 }
 
 ///
@@ -58,7 +63,12 @@ impl BallistaAdapter {
                     "stage ID has to be generated at this point".to_string(),
                 )
             })?;
-            self.inputs.push(stage_id);
+            let mut stage_output = StageOutput::new();
+            for partition in partitions.iter().flatten().cloned() {
+                stage_output.add_partition(partition);
+            }
+            stage_output.complete = true;
+            self.inputs.insert(stage_id, stage_output);
             let partitioning = exchange.properties().partitioning.clone();
 
             let reader = match (exchange.coalesce(), exchange.broadcast) {
@@ -105,7 +115,24 @@ impl BallistaAdapter {
                 )?,
             };
 
-            Ok(Transformed::yes(Arc::new(reader)))
+            let reader: Arc<dyn ExecutionPlan> = Arc::new(reader);
+            // Without a per-partition filter, straddling sub-parts from a
+            // range-repartitioned upstream would feed multiple downstream
+            // partitions and `FinalPartitioned` would split their partial sums.
+            if let Some(routing) = exchange.range_repartition_routing() {
+                let predicates =
+                    range_partition_predicates(routing.routing_expr, &routing.cuts);
+                debug!(
+                    "range-repartition: injecting PerPartitionFilterExec above \
+                     ShuffleReader for stage {} — {} predicates over {} cuts",
+                    stage_id,
+                    predicates.len(),
+                    routing.cuts.len(),
+                );
+                let filtered = PerPartitionFilterExec::try_new(reader, predicates)?;
+                return Ok(Transformed::yes(Arc::new(filtered)));
+            }
+            Ok(Transformed::yes(reader))
         } else {
             Ok(Transformed::no(plan))
         }
