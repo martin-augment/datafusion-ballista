@@ -956,10 +956,13 @@ impl ExecutionGraph for StaticExecutionGraph {
                             let SuccessfulTask {
                                 partitions,
                                 runtime_stats,
+                                window_state,
                                 ..
                             } = successful_task;
                             running_stage
                                 .append_runtime_stats_reports(task_id, runtime_stats);
+                            running_stage
+                                .append_window_state_reports(task_id, window_state);
 
                             locations.append(&mut partition_to_location(
                                 &job_id, task_id, stage_id, executor, partitions,
@@ -1824,9 +1827,10 @@ mod test {
         self, ExecutionError, FailedTask, FetchPartitionError, IoError, JobStatus,
         TaskKilled, failed_task, job_status, task_status,
     };
-    use datafusion::arrow::error::ArrowError;
+    use datafusion::common::tree_node::TreeNodeRecursion;
     use datafusion::common::{DataFusionError, Result as DataFusionResult};
     use datafusion::execution::TaskContext;
+    use datafusion::physical_expr::PhysicalExpr;
     use datafusion::physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
         SendableRecordBatchStream,
@@ -1868,6 +1872,15 @@ mod test {
 
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![&self.input]
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn PhysicalExpr>,
+            ) -> DataFusionResult<TreeNodeRecursion>,
+        ) -> DataFusionResult<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
         }
 
         fn with_new_children(
@@ -3223,17 +3236,15 @@ mod test {
         map_stage_id: usize,
         map_partition_id: usize,
     ) -> FailedTask {
-        let err = BallistaError::DataFusionError(Box::new(DataFusionError::ArrowError(
-            Box::new(ArrowError::ExternalError(Box::new(
-                BallistaError::FetchFailed(
-                    executor_id.to_owned(),
-                    map_stage_id,
-                    map_partition_id,
-                    "FetchPartitionError".to_owned(),
-                ),
-            ))),
-            None,
-        )));
+        let err = BallistaError::DataFusionError(Box::new(
+            BallistaError::FetchFailed(
+                executor_id.to_owned(),
+                map_stage_id,
+                map_partition_id,
+                "FetchPartitionError".to_owned(),
+            )
+            .into_datafusion(),
+        ));
         FailedTask::from(err)
     }
 
