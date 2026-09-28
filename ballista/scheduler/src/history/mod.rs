@@ -44,7 +44,9 @@ use std::time::{Duration, SystemTime};
 struct JobEntry {
     /// Frozen summary, everything `GET /api/jobs` reports.
     index: JobIndex,
-    /// The `<job_id>.eventlog` the rest of the job is read back from.
+    /// The `<job_id>.eventlog` the rest of the job is read back from. A job
+    /// still running is named `<job_id>.eventlog.running` and has no entry
+    /// here yet.
     path: PathBuf,
 }
 
@@ -70,10 +72,11 @@ struct FileStamp {
 struct Index {
     /// Completed jobs keyed by job id.
     jobs: HashMap<String, JobEntry>,
-    /// Every `.eventlog` seen so far and the job id it produced, if any. Logs
-    /// that are still running (no terminal record yet) or unreadable are kept
-    /// here with `None` so a rescan can tell "already looked at, unchanged"
-    /// from "never seen".
+    /// Every `.eventlog` seen so far and the job id it produced, if any.
+    /// Logs still running are named `.eventlog.running` and never reach this
+    /// map at all (see `scan_dir`); an entry with `None` here means an
+    /// `.eventlog` file that was unreadable or lacked its terminal record,
+    /// so a rescan can tell "already looked at, unchanged" from "never seen".
     seen: HashMap<PathBuf, (FileStamp, Option<String>)>,
 }
 
@@ -273,6 +276,10 @@ impl HistoryStore {
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
             let path = entry.path();
+            // A job still running (or abandoned by a crashed scheduler) is
+            // named `<job_id>.eventlog.running`, whose extension is
+            // "running", not "eventlog" — this check relies on that to skip
+            // it without ever opening it.
             if path.extension().and_then(|e| e.to_str()) != Some("eventlog") {
                 continue;
             }
@@ -536,6 +543,7 @@ async fn get_executors_empty() -> Json<Vec<()>> {
 async fn get_state() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "started": 0,
+        "scheduler_id": "history-server",
         "version": BALLISTA_VERSION,
         "datafusion_version": DATAFUSION_VERSION,
         "substrait_support": false,
@@ -544,6 +552,7 @@ async fn get_state() -> Json<serde_json::Value> {
         "graphviz_support": false,
         "spark_support": false,
         "scheduling_policy": "history-server",
+        "enable_embedded_flight_proxy": false,
     }))
 }
 
@@ -713,6 +722,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         for field in [
             "started",
+            "scheduler_id",
             "version",
             "datafusion_version",
             "substrait_support",
@@ -721,9 +731,12 @@ mod tests {
             "graphviz_support",
             "spark_support",
             "scheduling_policy",
+            "enable_embedded_flight_proxy",
         ] {
             assert!(value.get(field).is_some(), "missing field: {field}");
         }
+        assert_eq!(value["scheduler_id"], "history-server");
+        assert_eq!(value["enable_embedded_flight_proxy"], false);
     }
 
     /// Job ids are random 7-character strings, so ordering the list by id puts
@@ -913,23 +926,27 @@ mod tests {
         assert_eq!(store.len(), 1);
     }
 
-    /// A log with no terminal record yet is a job still running. It is not
-    /// listed, but it must not be written off either: the next rescan after
-    /// the job ends has to pick it up.
+    /// A job still running is named `.eventlog.running` and is invisible to a
+    /// scan; it must not be written off, though: the next rescan after the
+    /// job ends and the writer renames the file has to pick it up.
     #[test]
     fn refresh_indexes_a_log_that_gains_its_terminal_record() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("job-1.eventlog");
+        let running_path = dir.path().join("job-1.eventlog.running");
+        let final_path = dir.path().join("job-1.eventlog");
         std::fs::write(
-            &path,
+            &running_path,
             "{\"ev\":\"StageStart\",\"version\":1,\"data\":{\"stage_id\":1}}\n",
         )
         .unwrap();
 
         let store = HistoryStore::load(dir.path()).unwrap();
-        assert!(store.is_empty());
+        assert!(store.is_empty(), "a .running file must not be indexed");
 
-        write_job_end_log(&path, "job-1");
+        // Simulate what EventLogWriter::finish_job does on completion: write
+        // the real terminal content, then rename into place.
+        write_job_end_log(&running_path, "job-1");
+        std::fs::rename(&running_path, &final_path).unwrap();
 
         assert_eq!(store.refresh().unwrap().added, 1);
         assert_eq!(store.len(), 1);
